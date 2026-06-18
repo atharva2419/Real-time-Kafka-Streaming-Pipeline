@@ -1,0 +1,8 @@
+kafka-python
+sseclient-py
+requests
+fastapi
+uvicorn
+redis
+python-dotenv
+websockets
