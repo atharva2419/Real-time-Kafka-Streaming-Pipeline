@@ -1,0 +1,152 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Wikimedia Edit Stream</title>
+<script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script>
+<style>
+  :root {
+    --bg: #0e1117; --panel: #161b22; --line: #262d38;
+    --text: #e6edf3; --muted: #8b949e; --accent: #58a6ff; --bot: #f0883e;
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--bg); color: var(--text);
+         font: 14px/1.5 ui-sans-serif, system-ui, -apple-system, sans-serif; }
+  header { padding: 20px 24px; border-bottom: 1px solid var(--line);
+           display: flex; align-items: baseline; gap: 16px; flex-wrap: wrap; }
+  h1 { font-size: 17px; margin: 0; font-weight: 600; }
+  .status { margin-left: auto; font-size: 12px; color: var(--muted); }
+  .dot { display: inline-block; width: 8px; height: 8px; border-radius: 50%;
+         background: #3fb950; margin-right: 6px; vertical-align: middle; }
+  .dot.down { background: #f85149; }
+  main { padding: 24px; display: grid; gap: 16px;
+         grid-template-columns: repeat(auto-fit, minmax(300px, 1fr)); }
+  .card { background: var(--panel); border: 1px solid var(--line);
+          border-radius: 10px; padding: 18px; }
+  .card.wide { grid-column: 1 / -1; }
+  .card h2 { font-size: 12px; text-transform: uppercase; letter-spacing: .06em;
+             color: var(--muted); margin: 0 0 14px; font-weight: 600; }
+  .tiles { display: grid; gap: 16px; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
+           grid-column: 1 / -1; }
+  .tile { background: var(--panel); border: 1px solid var(--line);
+          border-radius: 10px; padding: 16px 18px; }
+  .tile .v { font-size: 26px; font-weight: 600; font-variant-numeric: tabular-nums; }
+  .tile .k { font-size: 12px; color: var(--muted); margin-top: 2px; }
+  table { width: 100%; border-collapse: collapse; font-variant-numeric: tabular-nums; }
+  td { padding: 5px 0; border-bottom: 1px solid var(--line); }
+  td:last-child { text-align: right; color: var(--muted); }
+  tr:last-child td { border-bottom: 0; }
+  .bar { height: 6px; background: var(--accent); border-radius: 3px; margin-top: 4px; }
+</style>
+</head>
+<body>
+<header>
+  <h1>Wikimedia Edit Stream</h1>
+  <span style="color:var(--muted);font-size:12px">5-second tumbling windows</span>
+  <span class="status"><span class="dot" id="dot"></span><span id="conn">connecting…</span></span>
+</header>
+
+<main>
+  <div class="tiles">
+    <div class="tile"><div class="v" id="rate">–</div><div class="k">edits / second</div></div>
+    <div class="tile"><div class="v" id="total">–</div><div class="k">edits this window</div></div>
+    <div class="tile"><div class="v" id="botpct">–</div><div class="k">bot share</div></div>
+    <div class="tile"><div class="v" id="wikis">–</div><div class="k">active wikis</div></div>
+  </div>
+
+  <div class="card wide">
+    <h2>Throughput</h2>
+    <canvas id="chart" height="90"></canvas>
+  </div>
+
+  <div class="card"><h2>Top wikis</h2><table id="wikitable"></table></div>
+  <div class="card"><h2>Top editors</h2><table id="editortable"></table></div>
+  <div class="card"><h2>Edit types</h2><table id="typetable"></table></div>
+</main>
+
+<script>
+const MAX_POINTS = 120;
+const fmt = n => n.toLocaleString();
+const clock = t => new Date(t * 1000).toLocaleTimeString();
+
+const chart = new Chart(document.getElementById("chart"), {
+  type: "line",
+  data: { labels: [], datasets: [
+    { label: "edits/sec", data: [], borderColor: "#58a6ff",
+      backgroundColor: "rgba(88,166,255,.12)", fill: true, tension: .3,
+      pointRadius: 0, borderWidth: 2 },
+    { label: "bot edits/sec", data: [], borderColor: "#f0883e",
+      backgroundColor: "transparent", tension: .3, pointRadius: 0, borderWidth: 1.5 },
+  ]},
+  options: {
+    responsive: true, animation: false, interaction: { intersect: false, mode: "index" },
+    scales: {
+      x: { grid: { color: "#262d38" }, ticks: { color: "#8b949e", maxTicksLimit: 8 } },
+      y: { grid: { color: "#262d38" }, ticks: { color: "#8b949e" }, beginAtZero: true },
+    },
+    plugins: { legend: { labels: { color: "#8b949e", boxWidth: 12 } } },
+  },
+});
+
+function pushPoint(p) {
+  chart.data.labels.push(clock(p.t));
+  chart.data.datasets[0].data.push(p.rate);
+  chart.data.datasets[1].data.push(+(p.bot / 5).toFixed(2));
+  if (chart.data.labels.length > MAX_POINTS) {
+    chart.data.labels.shift();
+    chart.data.datasets.forEach(d => d.data.shift());
+  }
+}
+
+function renderTable(id, rows, max) {
+  const el = document.getElementById(id);
+  el.innerHTML = rows.map(([label, value]) => `
+    <tr><td>${label}<div class="bar" style="width:${max ? (value / max) * 100 : 0}%"></div></td>
+    <td>${fmt(value)}</td></tr>`).join("");
+}
+
+function render(w) {
+  const counts = w.bot_vs_human, seen = counts.bot + counts.human;
+  document.getElementById("rate").textContent = w.edits_per_second.toFixed(1);
+  document.getElementById("total").textContent = fmt(w.total_edits);
+  document.getElementById("botpct").textContent =
+    seen ? Math.round((counts.bot / seen) * 100) + "%" : "–";
+  document.getElementById("wikis").textContent = Object.keys(w.edits_per_wiki).length;
+
+  const wikis = Object.entries(w.edits_per_wiki).slice(0, 8);
+  renderTable("wikitable", wikis, wikis[0]?.[1] ?? 0);
+
+  const editors = w.top_editors.map(e => [e.user, e.count]);
+  renderTable("editortable", editors, editors[0]?.[1] ?? 0);
+
+  const types = Object.entries(w.edit_types);
+  renderTable("typetable", types, types[0]?.[1] ?? 0);
+
+  pushPoint({ t: w.window_start, rate: w.edits_per_second, bot: counts.bot });
+  chart.update();
+}
+
+function setStatus(ok, text) {
+  document.getElementById("dot").className = ok ? "dot" : "dot down";
+  document.getElementById("conn").textContent = text;
+}
+
+function connect() {
+  const proto = location.protocol === "https:" ? "wss" : "ws";
+  const socket = new WebSocket(`${proto}://${location.host}/ws`);
+
+  socket.onopen = () => setStatus(true, "live");
+  socket.onmessage = ev => {
+    const msg = JSON.parse(ev.data);
+    if (msg.type === "history") { msg.points.forEach(pushPoint); chart.update(); }
+    else if (msg.type === "window") render(msg.window);
+  };
+  socket.onclose = () => { setStatus(false, "reconnecting…"); setTimeout(connect, 2000); };
+  socket.onerror = () => socket.close();
+}
+
+connect();
+</script>
+</body>
+</html>

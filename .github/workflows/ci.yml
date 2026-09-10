@@ -1,0 +1,59 @@
+name: CI
+
+on:
+  push:
+    branches: [master, main]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        python-version: ["3.11", "3.12"]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: pip
+
+      - name: Install dependencies
+        run: pip install -r requirements-dev.txt
+
+      - name: Lint
+        run: ruff check .
+
+      - name: Test
+        run: pytest --cov --cov-report=term-missing
+
+  docker:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build images
+        run: docker compose build
+
+      - name: Start the stack
+        run: docker compose up -d
+
+      - name: Wait for the API to report a live window
+        run: |
+          for i in $(seq 1 60); do
+            if curl -sf http://localhost:8000/healthz | grep -q '"status":"ok"'; then
+              echo "pipeline is live"
+              curl -s http://localhost:8000/api/latest | head -c 400
+              exit 0
+            fi
+            sleep 5
+          done
+          echo "pipeline did not become healthy in time"
+          docker compose logs --tail=50
+          exit 1
+
+      - name: Tear down
+        if: always()
+        run: docker compose down -v

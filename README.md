@@ -1,224 +1,194 @@
 # Real-time Kafka Streaming Pipeline
 
-A real-time data streaming pipeline that ingests Wikimedia's public edit stream, aggregates metrics using tumbling windows, and streams results to a live WebSocket dashboard.
+Ingests Wikimedia's public edit firehose (~35 events/sec), aggregates it into
+5-second tumbling windows, and serves the result to a live WebSocket dashboard.
 
-**Resume bullet:** *Built a real-time streaming pipeline with Kafka, Python consumers, window aggregation, and a live WebSocket dashboard.*
+The interesting part is not the topology — it is the delivery semantics. The
+aggregator withholds Kafka offsets until the window a message landed in has been
+durably written, and the Redis sink is idempotent, so a `SIGKILL` mid-stream
+replays without losing or duplicating anything. Both properties were verified by
+actually killing the process; the measurements, including the two claims that
+turned out to be wrong, are in **[docs/DESIGN.md](docs/DESIGN.md)**.
 
 ---
 
 ## Architecture
 
 ```
-Wikimedia SSE Stream
+Wikimedia SSE firehose
   (stream.wikimedia.org)
-         │
-         │  HTTP chunked / text-event-stream
+         │  text/event-stream
          ▼
-  producer/produce.py
-  (sseclient + kafka-python)
+  pipeline/producer/produce.py
+  · validates + projects to 7 fields
+  · keyed by wiki -> per-wiki ordering
+  · idempotent producer, acks=all
          │
-         │  JSON messages → topic: "wiki-edits"
          ▼
-  Apache Kafka (Docker)
+  Kafka (KRaft, 6 partitions)  ──────┐
+         │                            │
+         ▼                            ▼
+  pipeline/consumer/aggregator.py   [more group members
+  · epoch-aligned tumbling windows    scale horizontally]
+  · arrival-time or watermark-driven
+    event-time bucketing
+  · commits offsets only after the
+    window is written
          │
-         ├──────────────────────────┐
-         │                          │
-         ▼                          ▼
-  consumer/aggregator.py      [future consumers]
-  (5s tumbling windows)
-         │
-         │  SET wiki:latest_window
-         │  RPUSH wiki:history
          ▼
        Redis
+  · wiki:latest_window  (TTL 30s)
+  · wiki:history        (zset + hash, keyed by window_start)
          │
          ▼
-  FastAPI (WebSocket)          [coming soon]
+  pipeline/api/server.py  (FastAPI)
+  · /ws pushes each new window
          │
          ▼
-  React Dashboard              [coming soon]
-  (live chart)
+  Live dashboard at localhost:8000
 ```
 
 ---
 
-## Stack
-
-| Layer | Technology |
-|---|---|
-| Message broker | Apache Kafka 7.6.0 (Confluent) |
-| Stream coordination | Apache ZooKeeper 7.6.0 |
-| Cache / state store | Redis 7 (Alpine) |
-| Producer | Python · `kafka-python` · `sseclient-py` · `requests` |
-| Consumer / aggregator | Python · `kafka-python` · `redis-py` |
-| API server | FastAPI · Uvicorn |
-| Frontend | React |
-| Infrastructure | Docker Compose |
-| Observability | Prometheus *(coming soon)* |
-
----
-
-## Project Structure
-
-```
-.
-├── docker-compose.yml          # Zookeeper, Kafka, Redis
-├── requirements.txt
-├── producer/
-│   └── produce.py              # SSE → Kafka producer
-└── consumer/
-    ├── window.py               # TumblingWindow class
-    └── aggregator.py           # Kafka consumer + Redis writer
-```
-
----
-
-## Prerequisites
-
-- [Docker Desktop](https://www.docker.com/products/docker-desktop/)
-- Python 3.11+
-- pip
-
----
-
-## Setup
-
-**1. Clone the repository**
+## Quick start
 
 ```bash
-git clone <repo-url>
-cd "Real-time Kafka Streaming Pipeline"
+docker compose up -d --build
 ```
 
-**2. Install Python dependencies**
+That is the whole thing — Kafka, Redis, producer, aggregator and API. Health
+checks gate startup order, so nothing races the broker. Open
+**http://localhost:8000**.
 
 ```bash
-pip install -r requirements.txt
-```
-
-**3. Start infrastructure (Kafka + ZooKeeper + Redis)**
-
-```bash
-docker compose up -d
-```
-
-Wait ~10 seconds for Kafka to finish initialising before running the producer.
-
----
-
-## Running
-
-Open three terminal windows.
-
-**Terminal 1 — Producer** (ingest Wikimedia edits → Kafka)
-
-```bash
-python producer/produce.py
-```
-
-Expected output:
-```
-Connected to Kafka at localhost:9092, publishing to 'wiki-edits'
-Produced 100 events (47/sec)
-Produced 200 events (51/sec)
-```
-
-**Terminal 2 — Aggregator** (Kafka → 5s tumbling windows → Redis)
-
-```bash
-python consumer/aggregator.py
-```
-
-Expected output:
-```
-Aggregator started — consuming 'wiki-edits', window=5s
-[14:32:05] 1,847 edits | enwiki: 412, dewiki: 201, frwiki: 98, eswiki: 74 | bots: 62%
-[14:32:10] 1,903 edits | enwiki: 389, dewiki: 188, frwiki: 112, ruwiki: 67 | bots: 58%
-```
-
-**Terminal 3 — Verify Redis output**
-
-```bash
-docker exec -it <redis-container-name> redis-cli
-GET wiki:latest_window
-LRANGE wiki:history 0 -1
-```
-
----
-
-## How It Works
-
-### Producer (`producer/produce.py`)
-
-Connects to Wikimedia's free public SSE endpoint — no authentication required. Each server-sent event is a JSON payload describing a wiki edit (page title, editor username, wiki site, bot flag, etc.). The producer strips the payload down to 7 fields and publishes to the `wiki-edits` Kafka topic. A background thread inside `kafka-python` batches and flushes messages to the broker asynchronously, so the hot loop is never blocked by network I/O. The outer `while True` reconnects automatically if the SSE stream or Kafka connection drops.
-
-### Tumbling Window (`consumer/window.py`)
-
-A `TumblingWindow` accumulates five counters over a fixed 5-second interval: total edits, edits per wiki, bot vs human ratio, event type distribution, and per-user edit counts. When `flush()` is called it snapshots the accumulators, advances the start pointer by exactly 5 seconds (preserving alignment even if flush is called slightly late), resets state, and returns a JSON-serialisable dict. Arrival time is used for window boundaries rather than event timestamps because Wikimedia's timestamps can lag wall-clock time by several seconds.
-
-### Aggregator (`consumer/aggregator.py`)
-
-Polls Kafka every 500 ms, feeds each message into the window, and after every poll checks whether the window has expired. On close it writes two things to Redis atomically via a pipeline: the full window summary JSON (30-second TTL) and the edit count appended to a time-series list capped at 60 entries (5 minutes of history).
-
----
-
-## Data Schema
-
-**Kafka message (`wiki-edits` topic)**
-
-```json
-{
-  "id": 12345678,
-  "type": "edit",
-  "title": "Python (programming language)",
-  "wiki": "enwiki",
-  "user": "SomeEditor",
-  "timestamp": 1718700000,
-  "bot": false
-}
-```
-
-**Redis `wiki:latest_window`**
-
-```json
-{
-  "window_start": 1718700005.123,
-  "window_end": 1718700010.123,
-  "total_edits": 1847,
-  "edits_per_wiki": { "enwiki": 412, "dewiki": 201, "frwiki": 98 },
-  "bot_vs_human": { "bot": 1143, "human": 704 },
-  "edit_types": { "edit": 1200, "new": 400, "log": 200, "categorize": 47 },
-  "top_editors": [
-    { "user": "CleanupBot", "count": 34 },
-    { "user": "WikiGnome", "count": 12 }
-  ]
-}
-```
-
-**Redis `wiki:history`** — list of integers, last 60 window totals (newest at right)
-
----
-
-## Stopping
-
-```bash
-# Stop the producer and aggregator with Ctrl+C in each terminal
-
-# Tear down Docker services
-docker compose down
-```
-
-To also delete all Kafka data and Redis state:
-
-```bash
+curl localhost:8000/healthz          # {"status":"ok","latest_window":...}
+curl localhost:8000/api/latest       # full window summary
+curl "localhost:8000/api/history?limit=20"
+docker compose logs -f aggregator
 docker compose down -v
 ```
 
+### Running it without Docker
+
+```bash
+python -m venv .venv && source .venv/bin/activate   # Windows: .venv\Scripts\activate
+pip install -r requirements-dev.txt
+cp .env.example .env
+
+docker compose up -d kafka redis     # infrastructure only
+
+python -m pipeline.producer.produce
+python -m pipeline.consumer.aggregator
+python -m pipeline.api.server
+```
+
+`kafka-python` 2.0.x cannot be imported on Python 3.12; `requirements.txt` pins
+`>=2.2` for that reason.
+
 ---
 
-## What's Coming
+## What it actually prints
 
-- `api/server.py` — FastAPI WebSocket server that streams Redis data to clients
-- `dashboard/` — React app with a live chart (Chart.js or Recharts)
-- Prometheus metrics endpoint on the aggregator
-- Docker Compose profiles to run the full stack with one command
+Real output, not illustrative:
+
+```
+22:17:56 INFO  [22:17:50]    67 edits (  13.4/s) | wikidatawiki: 18, enwiki: 17, elwiktionary: 8 | bots: 33%
+22:18:01 INFO  [22:17:55]   198 edits (  39.6/s) | commonswiki: 67, wikidatawiki: 42, enwiki: 29 | bots: 48%
+22:18:06 INFO  [22:18:00]   176 edits (  35.2/s) | wikidatawiki: 77, commonswiki: 32, enwiki: 13 | bots: 44%
+22:18:11 INFO  [22:18:05]   180 edits (  36.0/s) | wikidatawiki: 60, commonswiki: 46, enwiki: 20 | bots: 42%
+```
+
+The firehose runs at roughly **30–50 edits/sec**, so a 5-second window holds
+~150–250 edits. `wikidatawiki` and `commonswiki` are about half the volume, and
+bots are typically 40–50%.
+
+---
+
+## Testing
+
+```bash
+pytest                    # 90 tests
+pytest --cov              # 100% on window.py, offsets.py and sink.py
+ruff check .
+```
+
+The sink tests run against a **real Redis** rather than a fake, because the
+property under test — that a rewritten window overwrites in place — depends on
+Redis's own semantics and on a Lua script keeping two keys in step. A fake would
+only test my model of Redis. They skip automatically if Redis is not up.
+
+CI runs lint and tests on Python 3.11 and 3.12, then builds the stack and blocks
+until `/healthz` reports a live window, so a broken pipeline fails the build
+rather than only a broken unit.
+
+### Reproducing the crash test
+
+```bash
+docker compose exec redis redis-cli FLUSHALL
+docker compose kill -s SIGKILL aggregator
+sleep 15
+docker compose start aggregator
+# then inspect wiki:history for gaps and duplicates
+```
+
+In `event` mode the history comes back fully contiguous with zero duplicates. In
+the default `arrival` mode nothing is lost either, but the replayed backlog
+lands in the window open at restart — a hole plus one inflated window. Why, and
+which you want, is [§3 of the design notes](docs/DESIGN.md).
+
+---
+
+## Configuration
+
+Every setting is an environment variable; see [.env.example](.env.example).
+
+| Variable | Default | Notes |
+|---|---|---|
+| `KAFKA_BOOTSTRAP_SERVERS` | `localhost:9092` | `kafka:29092` inside compose |
+| `KAFKA_PARTITIONS` | `6` | Created explicitly; auto-creation gives 1 |
+| `WINDOW_SECONDS` | `5` | Windows are epoch-aligned |
+| `WINDOW_GRACE_SECONDS` | `1.0` | How long a closed window waits for stragglers |
+| `WINDOW_TIME_SOURCE` | `arrival` | `arrival` or `event` — see design notes |
+| `HISTORY_MAX` | `120` | Windows retained (10 minutes at 5s) |
+| `LATEST_TTL_SECONDS` | `30` | So a dead aggregator shows as degraded |
+
+---
+
+## Project layout
+
+```
+pipeline/
+├── config.py              env-driven configuration
+├── producer/produce.py    SSE -> Kafka, keyed by wiki
+├── consumer/
+│   ├── window.py          TumblingWindow + WindowManager (watermarks, gaps)
+│   ├── offsets.py         commit-after-write bookkeeping
+│   ├── sink.py            idempotent Redis writer (Lua)
+│   └── aggregator.py      the consume loop
+└── api/
+    ├── server.py          FastAPI: REST + WebSocket
+    └── static/index.html  dashboard
+tests/                     90 tests
+docs/DESIGN.md             semantics, trade-offs, measurements
+docker/Dockerfile          one image, three entrypoints
+```
+
+---
+
+## Known limitations
+
+Kept honest and current in [§6 of the design notes](docs/DESIGN.md). The
+short version: no metrics export yet (Prometheus + Grafana is the next
+addition), partial window state is not checkpointed across a rebalance, the
+watermark has no idle timeout, and Redis history is a rolling 10-minute window
+with no durable store behind it.
+
+## Roadmap
+
+- Prometheus metrics — consumer lag, flush latency, `late_events` — and Grafana
+- A rebalance listener wired to `OffsetTracker.forget()`
+- Load-generator mode replaying a captured file at N× speed, with a measured
+  throughput/latency table
+- Schema Registry + Avro, with a compatibility check in CI
+- A dead-letter topic for malformed events
+- A durable sink (ClickHouse or TimescaleDB) for history beyond the rolling window
