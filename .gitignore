@@ -10,4 +10,8 @@ htmlcov/
 *.egg-info/
 .DS_Store
 .idea/
-.vscode/
+
+# Ignore local VS Code state, but share the interpreter pin so a fresh
+# clone resolves imports without hand-configuring Pylance.
+.vscode/*
+!.vscode/settings.json

@@ -191,6 +191,26 @@ found by killing the process rather than by reading the code.
    two keys separately would leave orphaned payloads behind. Pinned by
    [`test_partial_window_is_corrected_not_duplicated`](../tests/test_sink.py).
 
+### 5.2 Over-strict validation was silently dropping 2.7% of the stream
+
+Adding producer-side validation introduced a bug that the original unvalidated
+code did not have. `REQUIRED_FIELDS` included `id`, so any event without one was
+discarded — and a 900-event sample of the live firehose showed **every single
+dropped event was a `type: "log"` entry with a null `id`**: page moves,
+deletions, user creations. All legitimate activity, and none of it needs an `id`,
+because the aggregator groups by wiki, type, user and bot flag.
+
+The effect was not just lost volume. The `log` bucket in the edit-type breakdown
+on the dashboard was systematically undercounted, which is the kind of error that
+looks like a plausible data distribution rather than a bug.
+
+`REQUIRED_FIELDS` is now `("type", "wiki")` — the two fields the aggregator
+actually groups by. Pinned by
+[`test_log_events_without_an_id_are_kept`](../tests/test_producer.py).
+
+The general lesson: a validation rule is a claim about which data is worthless,
+and it deserves to be checked against real traffic rather than assumed.
+
 ---
 
 ## 6. Known limitations

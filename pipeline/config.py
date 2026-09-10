@@ -13,12 +13,18 @@ def _str(name: str, default: str) -> str:
 
 def _int(name: str, default: int) -> int:
     raw = os.getenv(name)
-    return int(raw) if raw not in (None, "") else default
+    # Narrowed with `is None` rather than `not in (None, "")` so type checkers
+    # can follow it; an unset and an empty variable both mean "use the default".
+    if raw is None or raw == "":
+        return default
+    return int(raw)
 
 
 def _float(name: str, default: float) -> float:
     raw = os.getenv(name)
-    return float(raw) if raw not in (None, "") else default
+    if raw is None or raw == "":
+        return default
+    return float(raw)
 
 
 # --- Kafka ---------------------------------------------------------------

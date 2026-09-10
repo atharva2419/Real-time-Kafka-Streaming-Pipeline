@@ -24,7 +24,16 @@ from pipeline import config
 log = logging.getLogger("producer")
 
 RECONNECT_DELAY = 5
-REQUIRED_FIELDS = ("id", "type", "wiki")
+# Only the fields the aggregator actually groups by. `id` is deliberately
+# NOT required: Wikimedia log events (page moves, deletions, user creation)
+# carry a null id, and requiring it silently discarded ~2.7% of the stream
+# and undercounted the "log" bucket in the edit-type breakdown.
+REQUIRED_FIELDS = ("type", "wiki")
+# SSEClient consumes an iterator of byte chunks. Iterating a Response
+# directly would work, but only via Response.__iter__'s hardcoded 128-byte
+# chunks; iter_content yields as data arrives, so a larger size cuts
+# per-chunk overhead without adding latency.
+SSE_CHUNK_BYTES = 8192
 
 _running = True
 
@@ -74,11 +83,24 @@ def ensure_topic() -> None:
         admin.close()
 
 
+# typeshed's kafka-python stubs declare serializers as Callable[[object], bytes],
+# so they must accept any object: a `key: str` parameter is rejected, and a
+# lambda's argument is typed `object`, which has no .encode(). Narrow instead.
+def serialize_key(key: object) -> bytes:
+    if not isinstance(key, str):
+        raise TypeError(f"partition key must be str, got {type(key).__name__}")
+    return key.encode("utf-8")
+
+
+def serialize_value(value: object) -> bytes:
+    return json.dumps(value, separators=(",", ":")).encode("utf-8")
+
+
 def make_producer() -> KafkaProducer:
     return KafkaProducer(
         bootstrap_servers=config.KAFKA_BOOTSTRAP,
-        value_serializer=lambda v: json.dumps(v, separators=(",", ":")).encode("utf-8"),
-        key_serializer=lambda k: k.encode("utf-8"),
+        value_serializer=serialize_value,
+        key_serializer=serialize_key,
         # Durability over raw throughput: wait for all in-sync replicas, and
         # let the broker de-duplicate retried batches rather than producing
         # the same edit twice after a transient network blip.
@@ -142,7 +164,10 @@ def stream_events(producer: KafkaProducer, stats: Stats) -> None:
     )
     response.raise_for_status()
 
-    for sse in sseclient.SSEClient(response).events():
+    stream = response.iter_content(chunk_size=SSE_CHUNK_BYTES)
+    # The stub types event_source as Generator, but SSEClient only iterates
+    # it, so an Iterator satisfies the actual contract.
+    for sse in sseclient.SSEClient(stream).events():  # type: ignore[arg-type]
         if not _running:
             return
         if not sse.data or not sse.data.strip():

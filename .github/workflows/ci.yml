@@ -26,8 +26,23 @@ jobs:
       - name: Lint
         run: ruff check .
 
+      - name: Type check
+        run: mypy
+
+      # Redis is needed for the sink tests; without it they skip rather than
+      # fail, which would quietly hide the idempotency regressions they cover.
+      - name: Start Redis
+        run: docker compose up -d redis
+
       - name: Test
         run: pytest --cov --cov-report=term-missing
+
+      - name: Fail if sink tests were skipped
+        run: |
+          if pytest tests/test_sink.py -q | grep -q "skipped"; then
+            echo "Sink tests skipped - Redis was not reachable"
+            exit 1
+          fi
 
   docker:
     runs-on: ubuntu-latest

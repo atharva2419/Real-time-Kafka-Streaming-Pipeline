@@ -19,22 +19,46 @@ from pipeline import config  # noqa: E402
 from pipeline.consumer.sink import RedisSink, history_point  # noqa: E402
 from pipeline.consumer.window import TumblingWindow  # noqa: E402
 
+KEYS = (config.HISTORY_KEY, config.HISTORY_DATA_KEY, config.LATEST_KEY)
 
-@pytest.fixture
-def client():
+
+@pytest.fixture(scope="session")
+def redis_url():
+    """
+    Probe Redis once per session with a short timeout.
+
+    Per-test probing meant a developer without Redis running waited out one
+    connect timeout per test - about a minute for this module alone.
+    """
     r = redis.Redis(
-        host=config.REDIS_HOST, port=config.REDIS_PORT, decode_responses=True
+        host=config.REDIS_HOST,
+        port=config.REDIS_PORT,
+        decode_responses=True,
+        socket_connect_timeout=1,
     )
     try:
         r.ping()
-    except redis.RedisError:
-        pytest.skip(f"Redis not reachable on {config.REDIS_HOST}:{config.REDIS_PORT}")
+    except redis.RedisError as exc:
+        pytest.skip(
+            f"Redis not reachable on {config.REDIS_HOST}:{config.REDIS_PORT} "
+            f"({type(exc).__name__}) - run `docker compose up -d redis`",
+            allow_module_level=True,
+        )
+    finally:
+        r.close()
+    return (config.REDIS_HOST, config.REDIS_PORT)
 
-    for key in (config.HISTORY_KEY, config.HISTORY_DATA_KEY, config.LATEST_KEY):
+
+@pytest.fixture
+def client(redis_url):
+    host, port = redis_url
+    r = redis.Redis(host=host, port=port, decode_responses=True)
+    for key in KEYS:
         r.delete(key)
     yield r
-    for key in (config.HISTORY_KEY, config.HISTORY_DATA_KEY, config.LATEST_KEY):
+    for key in KEYS:
         r.delete(key)
+    r.close()
 
 
 @pytest.fixture

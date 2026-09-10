@@ -1,0 +1,16 @@
+{
+  // Pin the interpreter to the project venv. Without this VS Code auto-picks an
+  // interpreter (often a global Anaconda install) that does not have this
+  // project's dependencies, and Pylance reports every third-party import as
+  // unresolved even though the code runs fine.
+  "python.defaultInterpreterPath": "${workspaceFolder}/.venv/Scripts/python.exe",
+  "python.analysis.extraPaths": ["${workspaceFolder}"],
+  "python.testing.pytestEnabled": true,
+  "python.testing.pytestArgs": ["tests"],
+
+  // kafka-python ships no py.typed marker and has no stubs on typeshed, so
+  // Pylance cannot see into it. Matches the mypy override in pyproject.toml.
+  "python.analysis.diagnosticSeverityOverrides": {
+    "reportMissingModuleSource": "none"
+  }
+}

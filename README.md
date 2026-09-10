@@ -107,9 +107,10 @@ bots are typically 40–50%.
 ## Testing
 
 ```bash
-pytest                    # 90 tests
+pytest                    # 89 tests
 pytest --cov              # 100% on window.py, offsets.py and sink.py
 ruff check .
+mypy                      # clean across pipeline/ and tests/
 ```
 
 The sink tests run against a **real Redis** rather than a fake, because the
@@ -168,7 +169,7 @@ pipeline/
 └── api/
     ├── server.py          FastAPI: REST + WebSocket
     └── static/index.html  dashboard
-tests/                     90 tests
+tests/                     89 tests
 docs/DESIGN.md             semantics, trade-offs, measurements
 docker/Dockerfile          one image, three entrypoints
 ```

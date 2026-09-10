@@ -9,8 +9,10 @@ or scaled without disturbing the stream.
 import asyncio
 import json
 import logging
+from collections.abc import Awaitable
 from contextlib import asynccontextmanager
 from pathlib import Path
+from typing import cast
 
 import redis.asyncio as aioredis
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
@@ -46,10 +48,14 @@ async def read_history(r: aioredis.Redis, limit: int) -> list[dict]:
     The zset holds only ordering (member == window_start); the payloads live in
     a parallel hash so a rewritten window overwrites in place. See sink.py.
     """
-    members = await r.zrange(config.HISTORY_KEY, -limit, -1)
+    # redis-py shares one signature between its sync and async clients, so
+    # the declared return type is a union the checker cannot resolve here.
+    members = cast(list[str], await r.zrange(config.HISTORY_KEY, -limit, -1))
     if not members:
         return []
-    payloads = await r.hmget(config.HISTORY_DATA_KEY, members)
+    payloads = await cast(
+        "Awaitable[list[str | None]]", r.hmget(config.HISTORY_DATA_KEY, members)
+    )
     return [json.loads(p) for p in payloads if p]
 
 
