@@ -19,7 +19,7 @@ from kafka import KafkaProducer
 from kafka.admin import KafkaAdminClient, NewTopic
 from kafka.errors import KafkaError, TopicAlreadyExistsError
 
-from pipeline import config
+from pipeline import config, metrics
 
 log = logging.getLogger("producer")
 
@@ -41,6 +41,17 @@ _running = True
 def _stop(*_args) -> None:
     global _running
     _running = False
+
+
+def _on_send_error(exc: Exception) -> None:
+    """
+    Sends are asynchronous, so a batch that fails after the producer's own
+    retries would otherwise vanish: the future's exception is never looked at,
+    nothing is logged, and the event is simply gone. This is the only place
+    that loss becomes visible.
+    """
+    metrics.produce_errors.inc()
+    log.error("kafka send failed after retries: %s", exc)
 
 
 # ---------------------------------------------------------------------------
@@ -176,15 +187,20 @@ def stream_events(producer: KafkaProducer, stats: Stats) -> None:
             raw = json.loads(sse.data)
         except json.JSONDecodeError:
             stats.dropped += 1
+            metrics.events_dropped.labels(reason="unparseable").inc()
             continue
 
         event = extract_event(raw)
         if event is None:
             stats.dropped += 1
+            metrics.events_dropped.labels(reason="invalid").inc()
             continue
 
-        producer.send(config.KAFKA_TOPIC, key=event["wiki"], value=event)
+        producer.send(
+            config.KAFKA_TOPIC, key=event["wiki"], value=event
+        ).add_errback(_on_send_error)
         stats.sent += 1
+        metrics.events_produced.inc()
 
         line = stats.tick()
         if line:
@@ -200,6 +216,7 @@ def main() -> None:
     signal.signal(signal.SIGINT, _stop)
     signal.signal(signal.SIGTERM, _stop)
 
+    metrics.serve(config.PRODUCER_METRICS_PORT)
     ensure_topic()
 
     try:
@@ -215,9 +232,11 @@ def main() -> None:
         try:
             stream_events(producer, stats)
         except requests.exceptions.RequestException as exc:
+            metrics.sse_reconnects.labels(reason="sse").inc()
             log.warning("SSE stream error: %s - reconnecting in %ds", exc, RECONNECT_DELAY)
             time.sleep(RECONNECT_DELAY)
         except KafkaError as exc:
+            metrics.sse_reconnects.labels(reason="kafka").inc()
             log.warning("Kafka error: %s - reconnecting in %ds", exc, RECONNECT_DELAY)
             time.sleep(RECONNECT_DELAY)
             producer = make_producer()

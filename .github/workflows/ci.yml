@@ -50,10 +50,10 @@ jobs:
       - uses: actions/checkout@v4
 
       - name: Build images
-        run: docker compose build
+        run: docker compose --profile obs build
 
       - name: Start the stack
-        run: docker compose up -d
+        run: docker compose --profile obs up -d
 
       - name: Wait for the API to report a live window
         run: |
@@ -69,6 +69,22 @@ jobs:
           docker compose logs --tail=50
           exit 1
 
+      - name: Wait for every Prometheus target to be up
+        run: |
+          for i in $(seq 1 30); do
+            down=$(curl -sf 'http://localhost:9090/api/v1/targets?state=active'               | grep -o '"health":"[a-z]*"' | grep -cv '"health":"up"' || true)
+            total=$(curl -sf 'http://localhost:9090/api/v1/targets?state=active'               | grep -co '"health":"[a-z]*"' || echo 0)
+            if [ "$total" -ge 6 ] && [ "$down" -eq 0 ]; then
+              echo "all $total scrape targets up"
+              exit 0
+            fi
+            sleep 5
+          done
+          echo "scrape targets did not all come up"
+          curl -s 'http://localhost:9090/api/v1/targets?state=active'
+          docker compose --profile obs logs --tail=30 prometheus
+          exit 1
+
       - name: Tear down
         if: always()
-        run: docker compose down -v
+        run: docker compose --profile obs down -v

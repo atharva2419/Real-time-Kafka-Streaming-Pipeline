@@ -25,7 +25,7 @@ from kafka import KafkaConsumer, TopicPartition
 from kafka.errors import KafkaError
 from kafka.structs import OffsetAndMetadata
 
-from pipeline import config
+from pipeline import config, metrics
 from pipeline.consumer.offsets import OffsetTracker
 from pipeline.consumer.sink import RedisSink
 from pipeline.consumer.window import WindowManager
@@ -166,14 +166,19 @@ class Aggregator:
 
             for tp, messages in records.items():
                 manager = self._manager(tp.partition)
+                label = str(tp.partition)
+                metrics.events_consumed.labels(partition=label).inc(len(messages))
                 for msg in messages:
                     ts = event_timestamp(msg.value, arrival, self.time_source)
                     if manager.add(msg.value, ts):
                         self.offsets.record(
                             tp.topic, tp.partition, msg.offset, manager.align(ts)
                         )
+                    else:
+                        metrics.late_events.labels(partition=label).inc()
 
             self._flush(arrival)
+            self._observe(arrival)
 
         self._shutdown()
 
@@ -196,7 +201,21 @@ class Aggregator:
 
         # ① Durable first: if this raises, nothing below runs and the offsets
         #    stay uncommitted, so Kafka replays these messages.
-        self.sink.write(entries)
+        try:
+            with metrics.sink_write_seconds.time():
+                retained = self.sink.write(entries)
+        except Exception:
+            metrics.sink_errors.inc()
+            raise
+        if retained is not None:
+            metrics.history_windows.set(retained)
+
+        emitted_at = time.time()
+        for partition, summary in entries:
+            metrics.windows_emitted.labels(partition=str(partition)).inc()
+            # Measured against wall clock, so in event-time mode this includes
+            # however far behind real time the stream itself is running.
+            metrics.window_emit_delay.observe(emitted_at - summary["window_end"])
 
         # ② Only now are these offsets safe to commit, per partition.
         commits: dict[tuple[str, int], int] = {}
@@ -212,6 +231,19 @@ class Aggregator:
             self.consumer.commit(build_commit(commits))
 
         self._log(entries)
+
+    def _observe(self, now: float) -> None:
+        """Refresh the gauges that describe in-memory state."""
+        metrics.assigned_partitions.set(len(self._managers))
+        metrics.open_windows.set(
+            sum(m.open_windows for m in self._managers.values())
+        )
+        for partition, manager in self._managers.items():
+            watermark = manager.watermark
+            if watermark is not None:
+                metrics.watermark_lag_seconds.labels(partition=str(partition)).set(
+                    now - watermark
+                )
 
     def _log(self, entries: list[tuple[int, dict]]) -> None:
         """Log this instance's own contribution, merged across its partitions."""
@@ -250,6 +282,8 @@ def main() -> None:
         format="%(asctime)s %(levelname)-7s %(message)s",
         datefmt="%H:%M:%S",
     )
+
+    metrics.serve(config.AGGREGATOR_METRICS_PORT)
 
     r = redis.Redis(
         host=config.REDIS_HOST, port=config.REDIS_PORT, decode_responses=True

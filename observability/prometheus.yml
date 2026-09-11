@@ -1,0 +1,44 @@
+# Scrape interval matches the 5s window size: a slower scrape would alias the
+# per-window signals. Counters are used for anything event-driven so that
+# rate() stays exact regardless.
+global:
+  scrape_interval: 5s
+  evaluation_interval: 15s
+
+rule_files:
+  - /etc/prometheus/alerts.yml
+
+scrape_configs:
+  # Docker Compose's DNS returns one A record per container, so these targets
+  # follow `--scale aggregator=N` without any config change.
+  - job_name: producer
+    dns_sd_configs:
+      - names: [producer]
+        type: A
+        port: 8001
+
+  - job_name: aggregator
+    dns_sd_configs:
+      - names: [aggregator]
+        type: A
+        port: 8002
+
+  - job_name: api
+    dns_sd_configs:
+      - names: [api]
+        type: A
+        port: 8000
+
+  # Consumer lag is read from the broker rather than from the aggregator on
+  # purpose: an in-app lag metric disappears exactly when the aggregator dies.
+  - job_name: kafka
+    static_configs:
+      - targets: [kafka-exporter:9308]
+
+  - job_name: redis
+    static_configs:
+      - targets: [redis-exporter:9121]
+
+  - job_name: prometheus
+    static_configs:
+      - targets: [localhost:9090]

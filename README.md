@@ -62,6 +62,15 @@ That is the whole thing — Kafka, Redis, producer, aggregator and API. Health
 checks gate startup order, so nothing races the broker. Open
 **http://localhost:8000**.
 
+Add metrics with a profile, which pulls in Prometheus, Grafana and two exporters:
+
+```bash
+docker compose --profile obs up -d --build
+```
+
+- **http://localhost:3000** — Grafana, dashboard provisioned, no login needed
+- **http://localhost:9090/alerts** — Prometheus and its seven alert rules
+
 ```bash
 curl localhost:8000/healthz          # {"status":"ok","latest_window":...}
 curl localhost:8000/api/latest       # full window summary
@@ -109,7 +118,7 @@ bots are typically 40–50%.
 ## Testing
 
 ```bash
-pytest                    # 117 tests
+pytest                    # 136 tests
 pytest --cov              # 100% on window.py, offsets.py, sink.py, merge.py
 ruff check .
 mypy                      # clean across pipeline/ and tests/
@@ -158,6 +167,43 @@ notes](docs/DESIGN.md) has the numbers and the fix.
 
 ---
 
+## Observability
+
+The app dashboard on :8000 shows Wikipedia's edit data. The Grafana board shows
+whether *this pipeline* is keeping up — a deliberately separate failure domain,
+because the app dashboard reads through the aggregator's own output and goes
+blank exactly when something breaks.
+
+| Signal | Source | Steady state (measured) |
+|---|---|---|
+| Ingest vs consume rate | app counters | ~28/s each, tracking |
+| Consumer lag per partition | `kafka-exporter` | ~90–110 total |
+| Window emit delay p50/p99 | app histogram | p99 **1.5 s** against a 2.5 s target |
+| Drops, late events, produce errors | app counters | 0 |
+| Redis write duration p99 | app histogram | ~2.5 ms |
+| Partitions covered, open windows | app gauges | 6 partitions, a handful of windows |
+
+Three decisions behind it worth knowing:
+
+- **Lag is measured from the broker, not from inside the aggregator.** An in-app
+  lag metric disappears exactly when the aggregator dies, which is when you need
+  it. `kafka-exporter` keeps reporting through an outage.
+- **Counters, not gauges, for anything event-driven.** Windows are 5 s and the
+  scrape interval is 5 s, so a gauge changing per window can be missed between
+  scrapes. `rate()` over a counter loses nothing.
+- **`partition` is the only per-series label.** It has six values. `wiki` has
+  hundreds and would multiply every series by that — per-wiki counts stay in
+  Redis, where they already are.
+
+Consumer lag never sits at zero, and that is by design: offsets are not
+committed until the window they fed has been written, so a steady baseline of
+roughly one window per partition is the system working correctly.
+
+Scrape targets are discovered by DNS, so `--scale aggregator=3` is picked up
+with no config change.
+
+---
+
 ## Configuration
 
 Every setting is an environment variable; see [.env.example](.env.example).
@@ -177,9 +223,11 @@ Every setting is an environment variable; see [.env.example](.env.example).
 ## Project layout
 
 ```
+observability/            Prometheus config, alert rules, Grafana dashboard
 pipeline/
 ├── config.py              env-driven configuration
 ├── merge.py               summing per-partition window slices
+├── metrics.py             Prometheus metric definitions
 ├── producer/produce.py    SSE -> Kafka, keyed by wiki
 ├── consumer/
 │   ├── window.py          TumblingWindow + WindowManager (watermarks, gaps)
@@ -189,7 +237,7 @@ pipeline/
 └── api/
     ├── server.py          FastAPI: REST + WebSocket
     └── static/index.html  dashboard
-tests/                     117 tests
+tests/                     136 tests
 docs/DESIGN.md             semantics, trade-offs, measurements
 docker/Dockerfile          one image, three entrypoints
 ```
@@ -199,17 +247,16 @@ docker/Dockerfile          one image, three entrypoints
 ## Known limitations
 
 Kept honest and current in [§6 of the design notes](docs/DESIGN.md). The
-short version: no metrics export yet (Prometheus + Grafana is the next
-addition), top-5 editors is approximate when several aggregators share the
+short version: top-5 editors is approximate when several aggregators share the
 topic (totals and per-wiki counts stay exact), there is no rebalance listener,
-the watermark has no idle timeout, and Redis history is a rolling 10-minute
-window with no durable store behind it.
+the watermark has no idle timeout, alerts are defined but not routed anywhere,
+and Redis history is a rolling 10-minute window with no durable store behind it.
 
 ## Roadmap
 
-- Prometheus metrics — consumer lag, flush latency, `late_events` — and Grafana
 - A rebalance listener wired to `OffsetTracker.forget()`
 - Kafka offsets stored in the sink's Lua script, for true exactly-once
+- Alertmanager, so the rules in `observability/alerts.yml` route somewhere
 - Load-generator mode replaying a captured file at N× speed, with a measured
   throughput/latency table
 - Schema Registry + Avro, with a compatibility check in CI

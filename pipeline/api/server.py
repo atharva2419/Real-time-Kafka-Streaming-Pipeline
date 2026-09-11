@@ -20,9 +20,10 @@ from typing import cast
 
 import redis.asyncio as aioredis
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
-from fastapi.responses import FileResponse, JSONResponse
+from fastapi.responses import FileResponse, JSONResponse, Response
+from prometheus_client import CONTENT_TYPE_LATEST, generate_latest
 
-from pipeline import config
+from pipeline import config, metrics
 from pipeline.consumer.sink import window_key
 from pipeline.merge import history_point, merge_partials
 
@@ -57,6 +58,7 @@ async def _index(r: aioredis.Redis, start: int, stop: int) -> list[str]:
     return cast(list[str], await r.zrange(config.HISTORY_KEY, start, stop))
 
 
+@metrics.redis_read_seconds.labels(op="latest").time()
 async def read_latest(r: aioredis.Redis) -> dict | None:
     members = await _index(r, -1, -1)
     if not members:
@@ -70,6 +72,7 @@ async def read_latest(r: aioredis.Redis) -> dict | None:
     return merge_partials(_slices(raw))
 
 
+@metrics.redis_read_seconds.labels(op="history").time()
 async def read_history(r: aioredis.Redis, limit: int) -> list[dict]:
     """
     Read the newest `limit` windows, oldest first.
@@ -139,6 +142,12 @@ async def healthz():
     }
 
 
+@app.get("/metrics")
+async def metrics_endpoint():
+    """Scraped by Prometheus. One uvicorn worker, so no multiprocess mode needed."""
+    return Response(generate_latest(), media_type=CONTENT_TYPE_LATEST)
+
+
 @app.get("/api/latest")
 async def latest():
     data = await read_latest(app.state.redis)
@@ -158,6 +167,7 @@ async def ws(socket: WebSocket):
     await socket.accept()
     r = app.state.redis
     last_sent: tuple[float, int] | None = None
+    metrics.ws_clients.inc()
 
     try:
         # Prime the client with enough history to draw a full chart.
@@ -180,6 +190,8 @@ async def ws(socket: WebSocket):
         pass
     except Exception as exc:
         log.warning("websocket closed: %s", exc)
+    finally:
+        metrics.ws_clients.dec()
 
 
 @app.get("/")

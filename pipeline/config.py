@@ -72,6 +72,12 @@ USER_AGENT = _str(
 )
 PRINT_EVERY = _int("PRINT_EVERY", 500)
 
+# --- Observability -------------------------------------------------------
+# The producer and aggregator are not HTTP servers, so each exposes /metrics on
+# its own port for Prometheus to scrape. The API serves its own route.
+PRODUCER_METRICS_PORT = _int("PRODUCER_METRICS_PORT", 8001)
+AGGREGATOR_METRICS_PORT = _int("AGGREGATOR_METRICS_PORT", 8002)
+
 # --- API -----------------------------------------------------------------
 API_HOST = _str("API_HOST", "0.0.0.0")
 API_PORT = _int("API_PORT", 8000)

@@ -1,0 +1,61 @@
+# Rules are evaluated by Prometheus and visible on its /alerts page. No
+# Alertmanager is wired up, so nothing is routed anywhere - these document what
+# would page, and let the expressions be checked against real data.
+groups:
+  - name: pipeline
+    rules:
+      - alert: PipelineStalled
+        expr: sum(rate(wiki_windows_emitted_total[1m])) == 0
+        for: 2m
+        labels: {severity: critical}
+        annotations:
+          summary: No windows written for 2 minutes
+          description: The aggregator is not emitting. Check it is running and that Redis is reachable.
+
+      - alert: NoEventsProduced
+        expr: sum(rate(wiki_events_produced_total[1m])) == 0
+        for: 2m
+        labels: {severity: critical}
+        annotations:
+          summary: Producer has stopped publishing
+          description: The upstream SSE stream may be down; check wiki_sse_reconnects_total.
+
+      - alert: ConsumerLagHigh
+        # Steady state is about one window of messages per partition, so this
+        # threshold is well clear of normal.
+        expr: sum(kafka_consumergroup_lag{consumergroup="wiki-aggregator"}) > 2000
+        for: 2m
+        labels: {severity: warning}
+        annotations:
+          summary: Consumer lag above 2000 messages
+          description: The aggregator is falling behind the producer.
+
+      - alert: FreshnessSLOBreached
+        expr: histogram_quantile(0.99, sum by (le) (rate(wiki_window_emit_delay_seconds_bucket[5m]))) > 2.5
+        for: 5m
+        labels: {severity: warning}
+        annotations:
+          summary: p99 window emit delay above the 2.5s target
+
+      - alert: ProduceErrors
+        # These are sends that failed after the producer's own retries, i.e.
+        # silent ingest loss. Any non-zero rate matters.
+        expr: increase(wiki_produce_errors_total[5m]) > 0
+        labels: {severity: critical}
+        annotations:
+          summary: Kafka sends are failing after retries
+
+      - alert: SinkErrors
+        expr: increase(wiki_sink_errors_total[5m]) > 0
+        labels: {severity: warning}
+        annotations:
+          summary: Redis writes are failing
+          description: Offsets are not committed while this happens, so data will replay rather than be lost.
+
+      - alert: EventsDropped
+        expr: sum(rate(wiki_events_dropped_total[5m])) > 1
+        for: 10m
+        labels: {severity: warning}
+        annotations:
+          summary: Producer is discarding events
+          description: Check the reason label - validation was once too strict and dropped 2.7% of the stream.

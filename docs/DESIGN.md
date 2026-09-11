@@ -181,7 +181,7 @@ Measured against the live stream at ~35 events/sec, 5s windows.
 | SSE stream drops | Producer reconnects after 5s. Appears as low-count windows, not missing ones. |
 | Redis is down | `write` raises, offsets are not released, nothing is committed — so the data replays once Redis returns. The process currently exits rather than retrying; see §6. |
 | Aggregator stops entirely | No new windows are indexed, so `/healthz` compares the newest window against the wall clock and reports `degraded` rather than the dashboard silently showing stale numbers. |
-| Producer outruns the consumer | Consumer lag grows, visible only through Kafka's own tooling today. See §6.1. |
+| Producer outruns the consumer | Consumer lag grows, visible per partition on the Grafana board and alertable above 2000 messages (§7). |
 | Clock jump / laptop sleep | Bounded by `max_gap_windows`; resynchronises instead of replaying the gap. |
 | Malformed SSE payload | Dropped and counted. Live rate is ~0.8% — events missing `id`, `type` or `wiki`. |
 
@@ -269,9 +269,9 @@ in `/api/latest` sums to the total. Pinned by
 
 Ordered by how much they matter.
 
-1. **No metrics export.** Consumer lag, window flush latency and `late_events`
-   are computed but only logged. A Prometheus endpoint plus a Grafana board is
-   the single highest-signal addition left.
+1. **Alerts are defined but not routed.** `observability/alerts.yml` is
+   evaluated by Prometheus and visible on its `/alerts` page, but there is no
+   Alertmanager, so nothing pages anyone.
 2. **`top_editors` is approximate across replicas.** Each partition slice
    carries only its own top 5, so a user spread thinly across several wikis can
    be missed. Totals, per-wiki counts, bot ratio and edit types stay exact, and
@@ -293,9 +293,77 @@ Ordered by how much they matter.
    mattered is a reducer writing a merged rollup.
 7. **The Lua script builds the window keys itself**, so they are not declared in
    `KEYS`. Correct on a single Redis; Redis Cluster would need hash tags.
-6. **No schema enforcement.** Messages are ad-hoc JSON. A Schema Registry with
+8. **No schema enforcement.** Messages are ad-hoc JSON. A Schema Registry with
    Avro plus a compatibility check in CI would catch producer/consumer drift.
-7. **Malformed events are counted and dropped**, not routed to a dead-letter
+9. **Malformed events are counted and dropped**, not routed to a dead-letter
    topic, so they cannot be inspected after the fact.
-8. **Single broker, replication factor 1.** Fine for a laptop, not a statement
-   about production topology.
+10. **Single broker, replication factor 1.** Fine for a laptop, not a statement
+    about production topology.
+
+---
+
+## 7. Observability
+
+Metrics live on a plane separate from the data path: Prometheus *pulls* each
+process's `/metrics` on a timer, so nothing in the write or read path depends on
+it. If Prometheus stops, the pipeline does not notice.
+
+That separation matters more than it sounds. The app dashboard reads Redis
+through the aggregator's own output, so it goes blank exactly when the pipeline
+breaks - the moment you most need to see what is happening. Scraping the
+processes directly keeps reporting through an outage.
+
+### What is measured
+
+| Signal | Type | Answers |
+|---|---|---|
+| `wiki_events_produced_total`, `wiki_events_consumed_total` | counters | Is the aggregator keeping up with the producer? |
+| `kafka_consumergroup_lag` (from `kafka-exporter`) | gauge | How far behind is each partition? |
+| `wiki_window_emit_delay_seconds` | histogram | Is the freshness target holding? |
+| `wiki_late_events_total`, `wiki_events_dropped_total{reason}` | counters | What do the time-source and validation choices cost? |
+| `wiki_produce_errors_total` | counter | Ingest loss that used to be silent (§6.1) |
+| `wiki_sink_write_seconds`, `wiki_sink_errors_total` | histogram, counter | Redis health |
+| `wiki_assigned_partitions`, `wiki_open_windows` | gauges | Is every partition owned? What would a crash recompute? |
+| `wiki_watermark_lag_seconds{partition}` | gauge | Per-partition liveness; in event mode, how far behind real time the stream is |
+
+### Three decisions worth defending
+
+**Lag is read from the broker, not from the app.** The aggregator could compute
+its own lag, but that metric disappears the moment the aggregator dies -
+precisely when it matters. `kafka-exporter` reads it from the broker and keeps
+reporting through the outage.
+
+**Counters, not gauges, for anything event-driven.** Windows are 5 s and the
+scrape interval is 5 s, so a gauge that changes once per window can be missed
+between scrapes. `rate()` over a counter is exact regardless of scrape timing.
+
+**`partition` is the only per-series label.** It has six values. `wiki` has
+hundreds and would multiply every series by that - the classic cardinality
+mistake. Per-wiki counts belong in Redis, where they already are.
+
+### Measured baselines
+
+Worth writing down, because "normal" is not obvious here:
+
+| | |
+|---|---|
+| Produced vs consumed | ~28/s each, tracking within noise |
+| Consumer lag | 90-110 messages total, **not zero by design** |
+| Window emit delay | p99 **1.5 s** against the 2.5 s target |
+| Redis write | p99 ~2.5 ms |
+| Drops, late events, produce errors | 0 |
+
+Consumer lag never reaches zero because offsets are not committed until the
+window they fed has been written (§1), so about one window per partition is
+always outstanding. An alert on "lag > 0" would fire forever; the rule uses 2000.
+
+The emit-delay figure is the first measurement of a number that had only been
+derived: grace (1 s) + poll (≤0.5 s) + write. Measured p99 is 1.5 s.
+
+### What is missing
+
+No Alertmanager, so the seven rules are a working expression and a description
+rather than a page. No tracing - at this size, per-window structured logs carry
+more than spans would. And the API runs a single uvicorn worker, so the metrics
+registry needs no multiprocess mode; that assumption breaks if it is ever scaled
+with workers instead of replicas.

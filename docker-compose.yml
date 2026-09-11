@@ -86,5 +86,60 @@ services:
       REDIS_HOST: redis
     restart: unless-stopped
 
+  # --- Observability -------------------------------------------------------
+  # Behind a profile, so `docker compose up` stays a five-container stack.
+  # Start it with: docker compose --profile obs up -d
+  kafka-exporter:
+    image: danielqsj/kafka-exporter:v1.7.0
+    profiles: [obs]
+    command: ["--kafka.server=kafka:29092"]
+    depends_on:
+      kafka:
+        condition: service_healthy
+    restart: unless-stopped
+
+  redis-exporter:
+    image: oliver006/redis_exporter:v1.67.0
+    profiles: [obs]
+    environment:
+      REDIS_ADDR: redis://redis:6379
+    depends_on:
+      redis:
+        condition: service_healthy
+    restart: unless-stopped
+
+  prometheus:
+    image: prom/prometheus:v2.55.1
+    profiles: [obs]
+    ports:
+      - "9090:9090"
+    volumes:
+      - ./observability/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - ./observability/alerts.yml:/etc/prometheus/alerts.yml:ro
+      - prometheus-data:/prometheus
+    restart: unless-stopped
+
+  grafana:
+    image: grafana/grafana:11.4.0
+    profiles: [obs]
+    ports:
+      - "3000:3000"
+    environment:
+      # Anonymous viewing so the board opens without a login prompt; this is a
+      # laptop demo, not a deployment.
+      GF_AUTH_ANONYMOUS_ENABLED: "true"
+      GF_AUTH_ANONYMOUS_ORG_ROLE: Viewer
+      GF_SECURITY_ADMIN_PASSWORD: admin
+      GF_USERS_DEFAULT_THEME: dark
+    volumes:
+      - ./observability/grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./observability/grafana/dashboards:/var/lib/grafana/dashboards:ro
+      - grafana-data:/var/lib/grafana
+    depends_on:
+      - prometheus
+    restart: unless-stopped
+
 volumes:
   kafka-data:
+  prometheus-data:
+  grafana-data:
