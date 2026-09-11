@@ -15,3 +15,6 @@ htmlcov/
 # clone resolves imports without hand-configuring Pylance.
 .vscode/*
 !.vscode/settings.json
+
+# Personal interview-prep notes; never committed.
+prep/

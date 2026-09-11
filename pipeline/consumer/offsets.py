@@ -1,20 +1,23 @@
 """
 Offset bookkeeping for commit-after-write.
 
-The naive version of "commit after the sink write" is wrong: by the time
-window N is written, poll() has usually already handed us messages belonging
-to window N+1. Committing the consumer's current position would mark those as
-processed even though they are still sitting in an open in-memory window, so a
-crash would lose them silently.
+The naive version of "commit after the sink write" is wrong: by the time window
+N is written, poll() has usually already handed us messages belonging to window
+N+1. Committing the consumer's current position would mark those as processed
+even though they are still sitting in an open in-memory window, so a crash
+would lose them silently.
 
-OffsetTracker records which window each message contributed to, and will only
-release an offset once the window containing it has been durably written.
+OffsetTracker records which window each message contributed to, and releases an
+offset only once the window containing it has been durably written.
 
-Combined with an idempotent sink (windows are keyed by their aligned start, and
-a window's contents are a deterministic function of its input events), this
-gives effectively-once output on top of at-least-once delivery: a crash replays
-the tail of the log, the same windows are recomputed, and the sink overwrites
-rather than duplicates.
+Releases are per partition because each partition has its own window state: a
+quiet partition can still be filling window N while a busy one has already
+emitted N+2, and neither should hold the other's offsets back.
+
+Combined with a sink keyed by (window_start, partition), this gives
+effectively-once output on top of at-least-once delivery: a crash replays the
+tail of the log, the same windows are recomputed, and the sink overwrites the
+same fields rather than duplicating them.
 """
 
 from collections import defaultdict
@@ -33,27 +36,30 @@ class OffsetTracker:
         if offset > per_window.get(window_start, -1):
             per_window[window_start] = offset
 
-    def release(self, through_window_start: float) -> dict[tuple[str, int], int]:
+    def release_partition(
+        self, topic: str, partition: int, through_window_start: float
+    ) -> int | None:
         """
-        Return the offsets that are now safe to commit, given that every window
-        up to and including `through_window_start` has been written.
+        Return the offset that is now safe to commit for one partition, given
+        that its windows up to and including `through_window_start` have been
+        written. None if nothing is releasable.
 
-        The returned value is the *next* offset to read per partition, which is
-        the committed-offset convention Kafka expects. Released entries are
+        The returned value is the *next* offset to read, which is the
+        committed-offset convention Kafka expects. Released entries are
         dropped, so calling twice is harmless.
         """
-        commits: dict[tuple[str, int], int] = {}
+        per_window = self._pending.get((topic, partition))
+        if not per_window:
+            return None
 
-        for tp, per_window in self._pending.items():
-            done = [w for w in per_window if w <= through_window_start]
-            if not done:
-                continue
-            highest = max(per_window[w] for w in done)
-            for w in done:
-                del per_window[w]
-            commits[tp] = highest + 1
+        done = [w for w in per_window if w <= through_window_start]
+        if not done:
+            return None
 
-        return commits
+        highest = max(per_window[w] for w in done)
+        for window in done:
+            del per_window[window]
+        return highest + 1
 
     def forget(self, topic: str, partition: int) -> None:
         """Drop state for a partition we no longer own (consumer rebalance)."""

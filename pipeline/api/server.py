@@ -4,11 +4,15 @@ FastAPI read layer over the Redis window store.
 The API never touches Kafka. The aggregator owns the write path, Redis is the
 hand-off point, and this process is a stateless reader, so it can be restarted
 or scaled without disturbing the stream.
+
+Windows are stored as one field per Kafka partition (see consumer/sink.py), so
+every read merges those fields back together via pipeline/merge.py.
 """
 
 import asyncio
 import json
 import logging
+import time
 from collections.abc import Awaitable
 from contextlib import asynccontextmanager
 from pathlib import Path
@@ -19,6 +23,8 @@ from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.responses import FileResponse, JSONResponse
 
 from pipeline import config
+from pipeline.consumer.sink import window_key
+from pipeline.merge import history_point, merge_partials
 
 log = logging.getLogger("api")
 STATIC = Path(__file__).parent / "static"
@@ -36,32 +42,75 @@ async def lifespan(app: FastAPI):
 app = FastAPI(title="Wiki Stream API", lifespan=lifespan)
 
 
+# ---------------------------------------------------------------------------
+# Reads
+# ---------------------------------------------------------------------------
+
+def _slices(raw: dict[str, str]) -> list[dict]:
+    """The per-partition slices of one window, newest write per partition."""
+    return [json.loads(value) for value in raw.values()]
+
+
+async def _index(r: aioredis.Redis, start: int, stop: int) -> list[str]:
+    # redis-py shares one signature between its sync and async clients, so the
+    # declared return type is a union the checker cannot resolve here.
+    return cast(list[str], await r.zrange(config.HISTORY_KEY, start, stop))
+
+
 async def read_latest(r: aioredis.Redis) -> dict | None:
-    raw = await r.get(config.LATEST_KEY)
-    return json.loads(raw) if raw else None
+    members = await _index(r, -1, -1)
+    if not members:
+        return None
+    raw = cast(
+        dict[str, str],
+        await cast("Awaitable[dict]", r.hgetall(window_key(float(members[0])))),
+    )
+    if not raw:
+        return None
+    return merge_partials(_slices(raw))
 
 
 async def read_history(r: aioredis.Redis, limit: int) -> list[dict]:
     """
     Read the newest `limit` windows, oldest first.
 
-    The zset holds only ordering (member == window_start); the payloads live in
-    a parallel hash so a rewritten window overwrites in place. See sink.py.
+    One HGETALL per window, pipelined into a single round trip. A dashboard
+    pulls the whole history on connect, so this is the hot read; if it ever
+    mattered, the fix is a reducer writing a merged rollup rather than merging
+    on every read.
     """
-    # redis-py shares one signature between its sync and async clients, so
-    # the declared return type is a union the checker cannot resolve here.
-    members = cast(list[str], await r.zrange(config.HISTORY_KEY, -limit, -1))
+    members = await _index(r, -limit, -1)
     if not members:
         return []
-    payloads = await cast(
-        "Awaitable[list[str | None]]", r.hmget(config.HISTORY_DATA_KEY, members)
-    )
-    return [json.loads(p) for p in payloads if p]
 
+    pipe = r.pipeline()
+    for member in members:
+        pipe.hgetall(window_key(float(member)))
+    results = cast(list[dict[str, str]], await pipe.execute())
+
+    points = []
+    for raw in results:
+        if not raw:
+            continue
+        point = history_point(_slices(raw))
+        if point is not None:
+            points.append(point)
+    return points
+
+
+# ---------------------------------------------------------------------------
+# Routes
+# ---------------------------------------------------------------------------
 
 @app.get("/healthz")
 async def healthz():
-    """Ready only if Redis answers *and* a window has been written recently."""
+    """
+    Ready only if Redis answers *and* a window was written recently.
+
+    Freshness is judged from the newest window's own timestamp rather than a
+    key's TTL, because with several aggregator replicas no single one owns the
+    "latest" key.
+    """
     try:
         await app.state.redis.ping()
     except Exception as exc:
@@ -69,11 +118,25 @@ async def healthz():
 
     latest = await read_latest(app.state.redis)
     if latest is None:
-        # Key has a TTL, so its absence means the aggregator has gone quiet.
         return JSONResponse(
-            {"status": "degraded", "reason": "no recent window"}, status_code=503
+            {"status": "degraded", "reason": "no windows"}, status_code=503
         )
-    return {"status": "ok", "latest_window": latest["window_start"]}
+
+    age = time.time() - latest["window_end"]
+    if age > config.STALE_AFTER_SECONDS:
+        return JSONResponse(
+            {
+                "status": "degraded",
+                "reason": "no recent window",
+                "age_seconds": round(age, 1),
+            },
+            status_code=503,
+        )
+    return {
+        "status": "ok",
+        "latest_window": latest["window_start"],
+        "partitions": latest["partitions"],
+    }
 
 
 @app.get("/api/latest")
@@ -94,7 +157,7 @@ async def history(limit: int = 60):
 async def ws(socket: WebSocket):
     await socket.accept()
     r = app.state.redis
-    last_sent: float | None = None
+    last_sent: tuple[float, int] | None = None
 
     try:
         # Prime the client with enough history to draw a full chart.
@@ -104,9 +167,14 @@ async def ws(socket: WebSocket):
 
         while True:
             data = await read_latest(r)
-            if data and data["window_start"] != last_sent:
-                last_sent = data["window_start"]
-                await socket.send_json({"type": "window", "window": data})
+            if data is not None:
+                # Track the total as well as the start: with several replicas a
+                # window can gain a partition's slice after we first read it,
+                # and the client needs that correction.
+                fingerprint = (data["window_start"], data["total_edits"])
+                if fingerprint != last_sent:
+                    last_sent = fingerprint
+                    await socket.send_json({"type": "window", "window": data})
             await asyncio.sleep(config.WS_PUSH_INTERVAL)
     except WebSocketDisconnect:
         pass

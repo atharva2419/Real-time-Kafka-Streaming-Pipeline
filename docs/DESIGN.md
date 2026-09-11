@@ -48,9 +48,9 @@ Replayed messages must not double-count. Two properties make this safe:
    restarted aggregator computes the same boundaries as the one that died.
 2. **A window's contents are a deterministic function of its input events.**
 
-The sink then addresses both keys by `window_start` *alone*, never by payload
-content, so a rewrite overwrites in place. See §5.1 — an earlier version keyed
-history on the payload, which was not good enough.
+The sink then addresses a window by **(`window_start`, partition)**, never by
+payload content, so a rewrite overwrites in place. Both halves of that key are
+load-bearing: §5.1 and §5.3 are the two bugs that proved it.
 
 ### What replay reconstructs depends on the time source
 
@@ -138,18 +138,34 @@ rather than as a frozen chart.
 
 ## 4. Partitioning and scale-out
 
-The producer keys each message by `wiki`. Consequences:
+The producer keys each message by `wiki`, and the topic is created explicitly
+with `KAFKA_PARTITIONS` (default 6). Auto-creation gave a single partition, which
+silently capped the consumer group at one useful member.
 
-- All edits for one wiki land on one partition and keep their relative order.
-- Adding a consumer to the group moves *whole wikis* between instances, so one
-  wiki's stream is never split across two independent window states.
-- The topic is created explicitly with `KAFKA_PARTITIONS` (default 6). Relying
-  on auto-creation gave a single partition, which silently capped the consumer
-  group at one useful member no matter how many were started.
+**What the key actually buys.** Not ordering: the aggregation is counting, and
+counting does not care what order events arrive in. The real payoff is that a
+wiki's events land on exactly one partition, so the per-partition
+`edits_per_wiki` maps have *disjoint key sets* and merge back together exactly.
+An earlier version of this document argued the key was about ordering; that was
+never the reason it mattered.
 
-The key distribution is skewed — `wikidatawiki` and `commonswiki` alone are
-roughly half the firehose — so partitions will not be evenly loaded. Balancing
-would mean giving up per-wiki ordering, which is not worth it here.
+**Window state is per partition.** Each aggregator keeps a `WindowManager` per
+assigned partition and writes one Redis field per partition (see §5.3), so
+instances in the group compose instead of colliding. Two consequences:
+
+- Event-time mode advances a watermark per partition rather than one global
+  maximum, so a busy partition can no longer make a quiet one's events look late.
+- Totals, per-wiki counts, bot ratios and edit types merge exactly.
+  `top_editors` does not: each slice carries only its own top 5, so a user
+  spread across several wikis can be missed. Exact top-k would mean storing
+  every user's count per window; at scale the honest answer is Space-Saving or a
+  Count-Min Sketch with a stated error bound.
+
+**The load is skewed, and that is acceptable.** Measured over 141,855 messages:
+P3 holds 45.3% and P5 40.2%, the other four between 1.7% and 6.4%. Consumer
+parallelism is therefore bounded by the hottest partition, not by the partition
+count. Spreading a hot wiki would mean salting the key (`wikidatawiki#0..3`) and
+giving up the disjointness that makes per-wiki merging exact.
 
 ---
 
@@ -160,10 +176,11 @@ Measured against the live stream at ~35 events/sec, 5s windows.
 | Failure | Observed behaviour |
 |---|---|
 | Aggregator `SIGKILL`ed, `arrival` mode | No events lost, no duplicate points. The 15s backlog replayed into the window open at restart: a 20s hole in the history followed by one window of **742 edits against a median of 184**. |
-| Aggregator `SIGKILL`ed, `event` mode | History **fully contiguous, zero duplicates, no spike** — the backlog was reattributed to its original windows. zset and payload hash stayed in step at 19/19 entries. |
+| Aggregator `SIGKILL`ed, `event` mode | History **fully contiguous, zero duplicates, no spike** — the backlog was reattributed to its original windows. Index and window hashes stayed in step at 19/19 entries. |
+| One of two replicas `SIGKILL`ed | Survivor took over all six partitions. History **contiguous, zero duplicates, index and hashes in step at 17/17**, with one 557-edit window where the backlog replayed (arrival mode, as above). |
 | SSE stream drops | Producer reconnects after 5s. Appears as low-count windows, not missing ones. |
 | Redis is down | `write` raises, offsets are not released, nothing is committed — so the data replays once Redis returns. The process currently exits rather than retrying; see §6. |
-| Aggregator stops entirely | `wiki:latest_window` has a 30s TTL, so it disappears and `/healthz` reports `degraded` rather than the dashboard silently showing stale numbers. |
+| Aggregator stops entirely | No new windows are indexed, so `/healthz` compares the newest window against the wall clock and reports `degraded` rather than the dashboard silently showing stale numbers. |
 | Producer outruns the consumer | Consumer lag grows, visible only through Kafka's own tooling today. See §6.1. |
 | Clock jump / laptop sleep | Bounded by `max_gap_windows`; resynchronises instead of replaying the gap. |
 | Malformed SSE payload | Dropped and counted. Live rate is ~0.8% — events missing `id`, `type` or `wiki`. |
@@ -211,6 +228,41 @@ actually groups by. Pinned by
 The general lesson: a validation rule is a claim about which data is worthless,
 and it deserves to be checked against real traffic rather than assumed.
 
+### 5.3 "Scale out by adding consumers" was false
+
+This document and the README both said extra group members would scale the
+aggregator horizontally. Running it with two replicas showed otherwise:
+
+| Window 23:45:30 | replica A (P0-P2) | replica B (P3-P5) | Redis stored | True |
+|---|---|---|---|---|
+| total edits | 13 | 104 | **104** | 117 |
+
+Each replica only ever sees its own partitions, so what it computes for a window
+is a *slice*. Keyed on `window_start` alone, both wrote the same key and the last
+write won: an 11% undercount here, and 89% had the other replica landed last. The
+general lesson is worth keeping: **overwrite-by-key idempotency and horizontal
+partitioning conflict whenever the key omits a dimension the writers are split
+on.**
+
+The fix adds that dimension. A window is a hash keyed by `window_start` with one
+field per partition, indexed by a sorted set of window starts:
+
+```
+wiki:history        ZSET  member = score = window_start
+wiki:win:<start>    HASH  field = partition -> that partition's slice
+```
+
+A replay overwrites exactly the field it wrote before, a replica can only touch
+fields for partitions it owns, and a rebalance just changes who writes a field.
+The index also makes duplicate history points *structurally* impossible, because
+a sorted-set member is unique. Readers sum the fields back together
+([`pipeline/merge.py`](../pipeline/merge.py)).
+
+Verified live with two replicas: 20 + 199 = 219, 11 + 228 = 239, 12 + 231 = 243.
+The API's merged totals match the replicas' own logs exactly, and every breakdown
+in `/api/latest` sums to the total. Pinned by
+[`test_two_replicas_do_not_overwrite_each_other`](../tests/test_sink.py).
+
 ---
 
 ## 6. Known limitations
@@ -220,19 +272,27 @@ Ordered by how much they matter.
 1. **No metrics export.** Consumer lag, window flush latency and `late_events`
    are computed but only logged. A Prometheus endpoint plus a Grafana board is
    the single highest-signal addition left.
-2. **Partial window state is not checkpointed.** A crash recomputes open windows
-   from the replayed log, which works, but a rebalance that moves a partition
-   mid-window discards that partition's contribution to the open window on the
-   old owner.
+2. **`top_editors` is approximate across replicas.** Each partition slice
+   carries only its own top 5, so a user spread thinly across several wikis can
+   be missed. Totals, per-wiki counts, bot ratio and edit types stay exact, and
+   with a single aggregator (the default) there is one slice and top-k is exact
+   too.
 3. **No consumer-group rebalance listener.** `OffsetTracker.forget()` exists but
-   is not wired to a partition-revoked callback, so a rebalance can leave stale
-   pending offsets in memory. They are never committed for a partition the
-   instance no longer owns, so this leaks memory rather than corrupting data.
+   is not wired to a partition-revoked callback, so a rebalance leaves stale
+   window state and pending offsets behind for partitions the instance no longer
+   owns. Nothing is committed for them, so this leaks memory rather than
+   corrupting data, but the open window on the old owner is dropped instead of
+   flushed and the new owner rebuilds it from the replayed log.
 4. **The watermark never regresses and has no idle timeout.** A single event
    with a far-future timestamp would advance it permanently and cause every
    subsequent event to be dropped as late. A real implementation bounds this.
 5. **Redis is not durable.** History is capped at `HISTORY_MAX` windows with no
    long-term store, so nothing outside that rolling window can be queried.
+6. **Reads merge on every request.** A connecting dashboard pulls `HISTORY_MAX`
+   windows, one pipelined `HGETALL` each. Fine at this size; the fix if it ever
+   mattered is a reducer writing a merged rollup.
+7. **The Lua script builds the window keys itself**, so they are not declared in
+   `KEYS`. Correct on a single Redis; Redis Cluster would need hash tags.
 6. **No schema enforcement.** Messages are ad-hoc JSON. A Schema Registry with
    Avro plus a compatibility check in CI would catch producer/consumer drift.
 7. **Malformed events are counted and dropped**, not routed to a dead-letter

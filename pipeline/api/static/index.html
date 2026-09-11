@@ -89,11 +89,27 @@ const chart = new Chart(document.getElementById("chart"), {
   },
 });
 
+const stamps = [];
+
 function pushPoint(p) {
+  // Bot rate as a share of this window's rate, so it doesn't assume a window size.
+  const botRate = p.total ? +(p.rate * (p.bot / p.total)).toFixed(2) : 0;
+
+  // A window can be revised after we first draw it: with several aggregator
+  // replicas a later one adds its partitions' slice. Replace, don't append.
+  if (stamps.length && stamps[stamps.length - 1] === p.t) {
+    const i = stamps.length - 1;
+    chart.data.datasets[0].data[i] = p.rate;
+    chart.data.datasets[1].data[i] = botRate;
+    return;
+  }
+
+  stamps.push(p.t);
   chart.data.labels.push(clock(p.t));
   chart.data.datasets[0].data.push(p.rate);
-  chart.data.datasets[1].data.push(+(p.bot / 5).toFixed(2));
+  chart.data.datasets[1].data.push(botRate);
   if (chart.data.labels.length > MAX_POINTS) {
+    stamps.shift();
     chart.data.labels.shift();
     chart.data.datasets.forEach(d => d.data.shift());
   }
@@ -123,7 +139,10 @@ function render(w) {
   const types = Object.entries(w.edit_types);
   renderTable("typetable", types, types[0]?.[1] ?? 0);
 
-  pushPoint({ t: w.window_start, rate: w.edits_per_second, bot: counts.bot });
+  pushPoint({
+    t: w.window_start, rate: w.edits_per_second,
+    bot: counts.bot, total: w.total_edits,
+  });
   chart.update();
 }
 

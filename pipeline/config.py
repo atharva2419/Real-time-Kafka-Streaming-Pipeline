@@ -37,14 +37,22 @@ CONSUMER_GROUP = _str("KAFKA_CONSUMER_GROUP", "wiki-aggregator")
 REDIS_HOST = _str("REDIS_HOST", "localhost")
 REDIS_PORT = _int("REDIS_PORT", 6379)
 
-LATEST_KEY = "wiki:latest_window"
+# Index of known windows: ZSET, member = score = window_start.
 HISTORY_KEY = "wiki:history"
-HISTORY_DATA_KEY = "wiki:history_data"
+# One HASH per window, field = partition, value = that partition's slice.
+# Partition-scoped so that aggregator replicas never overwrite each other.
+WINDOW_KEY_PREFIX = "wiki:win:"
 HISTORY_MAX = _int("HISTORY_MAX", 120)
-LATEST_TTL_SECONDS = _int("LATEST_TTL_SECONDS", 30)
+# A window older than the retained history is dead weight; the TTL is a safety
+# net for windows the trim never reaches because writing stopped.
+WINDOW_TTL_SECONDS = _int("WINDOW_TTL_SECONDS", 0)
+# /healthz reports degraded when the newest window is older than this.
+STALE_AFTER_SECONDS = _int("STALE_AFTER_SECONDS", 30)
 
 # --- Windowing -----------------------------------------------------------
 WINDOW_SECONDS = _int("WINDOW_SECONDS", 5)
+if WINDOW_TTL_SECONDS <= 0:
+    WINDOW_TTL_SECONDS = HISTORY_MAX * WINDOW_SECONDS * 2
 # How long to keep a closed window open for stragglers before emitting it.
 WINDOW_GRACE_SECONDS = _float("WINDOW_GRACE_SECONDS", 1.0)
 # "arrival" uses the time the event was polled from Kafka; "event" uses the

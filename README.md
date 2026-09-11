@@ -5,10 +5,11 @@ Ingests Wikimedia's public edit firehose (~35 events/sec), aggregates it into
 
 The interesting part is not the topology — it is the delivery semantics. The
 aggregator withholds Kafka offsets until the window a message landed in has been
-durably written, and the Redis sink is idempotent, so a `SIGKILL` mid-stream
-replays without losing or duplicating anything. Both properties were verified by
-actually killing the process; the measurements, including the two claims that
-turned out to be wrong, are in **[docs/DESIGN.md](docs/DESIGN.md)**.
+durably written, and each window is stored in Redis as one field per Kafka
+partition, so a `SIGKILL` mid-stream replays without losing or duplicating
+anything and two aggregators can share the work without overwriting each other.
+Every claim here was verified by running it — including three that turned out to
+be wrong, which is what **[docs/DESIGN.md](docs/DESIGN.md)** is mostly about.
 
 ---
 
@@ -28,8 +29,9 @@ Wikimedia SSE firehose
   Kafka (KRaft, 6 partitions)  ──────┐
          │                            │
          ▼                            ▼
-  pipeline/consumer/aggregator.py   [more group members
-  · epoch-aligned tumbling windows    scale horizontally]
+  pipeline/consumer/aggregator.py   [more group members:
+  · window state per partition        each writes only the
+  · epoch-aligned tumbling windows    partitions it owns]
   · arrival-time or watermark-driven
     event-time bucketing
   · commits offsets only after the
@@ -37,8 +39,8 @@ Wikimedia SSE firehose
          │
          ▼
        Redis
-  · wiki:latest_window  (TTL 30s)
-  · wiki:history        (zset + hash, keyed by window_start)
+  · wiki:history      zset index of window starts
+  · wiki:win:<start>  hash, one field per partition
          │
          ▼
   pipeline/api/server.py  (FastAPI)
@@ -107,8 +109,8 @@ bots are typically 40–50%.
 ## Testing
 
 ```bash
-pytest                    # 89 tests
-pytest --cov              # 100% on window.py, offsets.py and sink.py
+pytest                    # 117 tests
+pytest --cov              # 100% on window.py, offsets.py, sink.py, merge.py
 ruff check .
 mypy                      # clean across pipeline/ and tests/
 ```
@@ -137,6 +139,23 @@ the default `arrival` mode nothing is lost either, but the replayed backlog
 lands in the window open at restart — a hole plus one inflated window. Why, and
 which you want, is [§3 of the design notes](docs/DESIGN.md).
 
+### Scaling the aggregator
+
+```bash
+docker compose up -d --scale aggregator=2
+docker compose logs aggregator | grep edits    # each replica logs its own share
+curl localhost:8000/api/latest                 # the API serves the merged window
+```
+
+Kafka splits the six partitions across the group, and each replica writes only
+the Redis fields for the partitions it owns, so their work composes rather than
+collides. Measured with two replicas: 20 + 199 = 219, 11 + 228 = 239,
+12 + 231 = 243 — the merged totals match the replicas' own logs exactly.
+
+This did not use to work. Both replicas wrote the same key and the last one won,
+silently undercounting every window; [§5.3 of the design
+notes](docs/DESIGN.md) has the numbers and the fix.
+
 ---
 
 ## Configuration
@@ -151,7 +170,7 @@ Every setting is an environment variable; see [.env.example](.env.example).
 | `WINDOW_GRACE_SECONDS` | `1.0` | How long a closed window waits for stragglers |
 | `WINDOW_TIME_SOURCE` | `arrival` | `arrival` or `event` — see design notes |
 | `HISTORY_MAX` | `120` | Windows retained (10 minutes at 5s) |
-| `LATEST_TTL_SECONDS` | `30` | So a dead aggregator shows as degraded |
+| `STALE_AFTER_SECONDS` | `30` | `/healthz` degrades when the newest window is older |
 
 ---
 
@@ -160,16 +179,17 @@ Every setting is an environment variable; see [.env.example](.env.example).
 ```
 pipeline/
 ├── config.py              env-driven configuration
+├── merge.py               summing per-partition window slices
 ├── producer/produce.py    SSE -> Kafka, keyed by wiki
 ├── consumer/
 │   ├── window.py          TumblingWindow + WindowManager (watermarks, gaps)
 │   ├── offsets.py         commit-after-write bookkeeping
-│   ├── sink.py            idempotent Redis writer (Lua)
-│   └── aggregator.py      the consume loop
+│   ├── sink.py            idempotent, partition-scoped Redis writer (Lua)
+│   └── aggregator.py      the consume loop, window state per partition
 └── api/
     ├── server.py          FastAPI: REST + WebSocket
     └── static/index.html  dashboard
-tests/                     89 tests
+tests/                     117 tests
 docs/DESIGN.md             semantics, trade-offs, measurements
 docker/Dockerfile          one image, three entrypoints
 ```
@@ -180,14 +200,16 @@ docker/Dockerfile          one image, three entrypoints
 
 Kept honest and current in [§6 of the design notes](docs/DESIGN.md). The
 short version: no metrics export yet (Prometheus + Grafana is the next
-addition), partial window state is not checkpointed across a rebalance, the
-watermark has no idle timeout, and Redis history is a rolling 10-minute window
-with no durable store behind it.
+addition), top-5 editors is approximate when several aggregators share the
+topic (totals and per-wiki counts stay exact), there is no rebalance listener,
+the watermark has no idle timeout, and Redis history is a rolling 10-minute
+window with no durable store behind it.
 
 ## Roadmap
 
 - Prometheus metrics — consumer lag, flush latency, `late_events` — and Grafana
 - A rebalance listener wired to `OffsetTracker.forget()`
+- Kafka offsets stored in the sink's Lua script, for true exactly-once
 - Load-generator mode replaying a captured file at N× speed, with a measured
   throughput/latency table
 - Schema Registry + Avro, with a compatibility check in CI

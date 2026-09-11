@@ -1,6 +1,13 @@
 """
 Kafka -> tumbling windows -> Redis.
 
+Window state is kept **per partition**, not per process. That is what lets
+several aggregators share the topic: each one writes only the fields of the
+partitions it owns, and readers sum the fields back together. It also gives
+event-time mode a watermark per partition instead of one global maximum, so a
+busy partition can no longer race ahead and make a quiet partition's events
+look late.
+
 Delivery semantics: at-least-once from Kafka, idempotent at the sink, which
 adds up to effectively-once window output. See offsets.py and docs/DESIGN.md.
 """
@@ -11,6 +18,7 @@ import logging
 import signal
 import sys
 import time
+from collections import defaultdict
 
 import redis
 from kafka import KafkaConsumer, TopicPartition
@@ -21,6 +29,7 @@ from pipeline import config
 from pipeline.consumer.offsets import OffsetTracker
 from pipeline.consumer.sink import RedisSink
 from pipeline.consumer.window import WindowManager
+from pipeline.merge import merge_partials
 
 log = logging.getLogger("aggregator")
 
@@ -102,17 +111,44 @@ class Aggregator:
     def __init__(self, consumer: KafkaConsumer, r: redis.Redis) -> None:
         self.consumer = consumer
         self.sink = RedisSink(r)
-        self.windows = WindowManager(
-            size_seconds=config.WINDOW_SECONDS,
-            grace_seconds=config.WINDOW_GRACE_SECONDS,
-            max_gap_windows=config.MAX_GAP_WINDOWS,
-        )
         self.offsets = OffsetTracker()
         self.time_source = config.WINDOW_TIME_SOURCE
+        self._managers: dict[int, WindowManager] = {}
         self._running = True
 
     def stop(self, *_args) -> None:
         self._running = False
+
+    # ------------------------------------------------------------------
+    # Per-partition window state
+    # ------------------------------------------------------------------
+
+    def _manager(self, partition: int) -> WindowManager:
+        manager = self._managers.get(partition)
+        if manager is None:
+            manager = WindowManager(
+                size_seconds=config.WINDOW_SECONDS,
+                grace_seconds=config.WINDOW_GRACE_SECONDS,
+                max_gap_windows=config.MAX_GAP_WINDOWS,
+            )
+            self._managers[partition] = manager
+        return manager
+
+    def _clock(self, manager: WindowManager, now: float) -> float | None:
+        """
+        The clock that decides when this partition's windows close.
+
+        arrival mode: wall clock, so windows always close on schedule.
+        event mode:   this partition's own watermark, so a window stays open
+                      until that partition's stream has moved past it.
+        """
+        if self.time_source == "arrival":
+            return now
+        return manager.watermark
+
+    # ------------------------------------------------------------------
+    # Main loop
+    # ------------------------------------------------------------------
 
     def run(self) -> None:
         log.info(
@@ -129,52 +165,71 @@ class Aggregator:
             arrival = time.time()
 
             for tp, messages in records.items():
+                manager = self._manager(tp.partition)
                 for msg in messages:
                     ts = event_timestamp(msg.value, arrival, self.time_source)
-                    if self.windows.add(msg.value, ts):
+                    if manager.add(msg.value, ts):
                         self.offsets.record(
-                            tp.topic, tp.partition, msg.offset, self.windows.align(ts)
+                            tp.topic, tp.partition, msg.offset, manager.align(ts)
                         )
 
-            self._flush(self._clock(arrival))
+            self._flush(arrival)
 
         self._shutdown()
 
-    def _clock(self, now: float) -> float | None:
-        """
-        The clock that decides when a window closes.
+    def _flush(self, now: float) -> None:
+        entries: list[tuple[int, dict]] = []
+        released_through: dict[int, float] = {}
 
-        arrival mode: wall clock, so windows always close on schedule.
-        event mode:   the watermark, so a window stays open until the stream
-                      itself has moved past it. A stalled upstream therefore
-                      stalls the windows rather than emitting false zeros.
-        """
-        if self.time_source == "arrival":
-            return now
-        return self.windows.watermark
+        for partition, manager in self._managers.items():
+            clock = self._clock(manager, now)
+            if clock is None:
+                continue
+            summaries = manager.pop_closed(clock)
+            if not summaries:
+                continue
+            entries.extend((partition, summary) for summary in summaries)
+            released_through[partition] = summaries[-1]["window_start"]
 
-    def _flush(self, now: float | None) -> None:
-        if now is None:
-            return
-        summaries = self.windows.pop_closed(now)
-        if not summaries:
+        if not entries:
             return
 
-        self.sink.write(summaries)
+        # ① Durable first: if this raises, nothing below runs and the offsets
+        #    stay uncommitted, so Kafka replays these messages.
+        self.sink.write(entries)
 
-        # Only now are these offsets safe to commit.
-        commits = self.offsets.release(summaries[-1]["window_start"])
+        # ② Only now are these offsets safe to commit, per partition.
+        commits: dict[tuple[str, int], int] = {}
+        for partition, through in released_through.items():
+            offset = self.offsets.release_partition(
+                config.KAFKA_TOPIC, partition, through
+            )
+            if offset is not None:
+                commits[(config.KAFKA_TOPIC, partition)] = offset
+
+        # ③ Commit.
         if commits:
             self.consumer.commit(build_commit(commits))
 
-        for summary in summaries:
-            log.info(format_summary(summary))
+        self._log(entries)
+
+    def _log(self, entries: list[tuple[int, dict]]) -> None:
+        """Log this instance's own contribution, merged across its partitions."""
+        by_window: dict[float, list[dict]] = defaultdict(list)
+        for _partition, summary in entries:
+            by_window[summary["window_start"]].append(summary)
+
+        for start in sorted(by_window):
+            merged = merge_partials(by_window[start])
+            if merged is not None:
+                log.info(format_summary(merged))
 
     def _shutdown(self) -> None:
         log.info(
-            "shutting down - %d open windows discarded, %d late events seen",
-            self.windows.open_windows,
-            self.windows.late_events,
+            "shutting down - %d partitions, %d open windows discarded, %d late events",
+            len(self._managers),
+            sum(m.open_windows for m in self._managers.values()),
+            sum(m.late_events for m in self._managers.values()),
         )
         self.consumer.close()
 
@@ -202,7 +257,9 @@ def main() -> None:
     try:
         r.ping()
     except redis.RedisError as exc:
-        log.error("cannot reach Redis at %s:%s - %s", config.REDIS_HOST, config.REDIS_PORT, exc)
+        log.error(
+            "cannot reach Redis at %s:%s - %s", config.REDIS_HOST, config.REDIS_PORT, exc
+        )
         sys.exit(1)
 
     try:
