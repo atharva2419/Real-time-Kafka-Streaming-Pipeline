@@ -200,7 +200,14 @@ committed until the window they fed has been written, so a steady baseline of
 roughly one window per partition is the system working correctly.
 
 Scrape targets are discovered by DNS, so `--scale aggregator=3` is picked up
-with no config change.
+with no config change. To check the stack is fully wired:
+
+```bash
+bash scripts/wait_for_targets.sh      # blocks until all 6 targets scrape clean
+```
+
+CI runs that same script, so a broken metrics config fails the build rather than
+silently producing an empty dashboard.
 
 ---
 

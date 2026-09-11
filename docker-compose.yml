@@ -117,6 +117,10 @@ services:
       - ./observability/prometheus.yml:/etc/prometheus/prometheus.yml:ro
       - ./observability/alerts.yml:/etc/prometheus/alerts.yml:ro
       - prometheus-data:/prometheus
+    depends_on:
+      - producer
+      - aggregator
+      - api
     restart: unless-stopped
 
   grafana:

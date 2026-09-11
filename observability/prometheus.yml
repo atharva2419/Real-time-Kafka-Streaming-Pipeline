@@ -15,18 +15,21 @@ scrape_configs:
     dns_sd_configs:
       - names: [producer]
         type: A
+        refresh_interval: 10s
         port: 8001
 
   - job_name: aggregator
     dns_sd_configs:
       - names: [aggregator]
         type: A
+        refresh_interval: 10s
         port: 8002
 
   - job_name: api
     dns_sd_configs:
       - names: [api]
         type: A
+        refresh_interval: 10s
         port: 8000
 
   # Consumer lag is read from the broker rather than from the aggregator on

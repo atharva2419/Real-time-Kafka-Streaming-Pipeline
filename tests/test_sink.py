@@ -7,6 +7,10 @@ each other, and the trim keeping the index and the per-window hashes in step -
 depend on Redis's own semantics. A fake would only test my model of Redis.
 
 Skipped automatically when Redis is not reachable: `docker compose up -d redis`.
+
+They run against a separate Redis database (15) rather than the one the pipeline
+uses, because the fixtures delete every window key they touch. Sharing db 0 with
+a running stack meant a test run silently wiped the live dashboard's history.
 """
 
 import json
@@ -14,6 +18,9 @@ import json
 import pytest
 
 redis = pytest.importorskip("redis")
+
+# Not db 0: that is where a locally running pipeline keeps its windows.
+TEST_DB = 15
 
 from pipeline import config  # noqa: E402
 from pipeline.consumer.sink import RedisSink, window_key  # noqa: E402
@@ -32,6 +39,7 @@ def redis_url():
     r = redis.Redis(
         host=config.REDIS_HOST,
         port=config.REDIS_PORT,
+        db=TEST_DB,
         decode_responses=True,
         socket_connect_timeout=1,
     )
@@ -58,7 +66,7 @@ def _clear(r):
 @pytest.fixture
 def client(redis_url):
     host, port = redis_url
-    r = redis.Redis(host=host, port=port, decode_responses=True)
+    r = redis.Redis(host=host, port=port, db=TEST_DB, decode_responses=True)
     _clear(r)
     yield r
     _clear(r)
