@@ -183,3 +183,36 @@ def test_scrape_interval_matches_the_window_size():
     interval = re.search(r"scrape_interval:\s*(\d+)s", prometheus_yml)
     assert interval is not None
     assert int(interval.group(1)) <= config.WINDOW_SECONDS
+
+
+# ---------------------------------------------------------------------------
+# Alert rules that can actually fire
+# ---------------------------------------------------------------------------
+
+def alert_expressions() -> dict[str, str]:
+    text = (OBSERVABILITY / "alerts.yml").read_text(encoding="utf-8")
+    return dict(re.findall(r"- alert:\s*(\w+)\s*\n\s*expr:\s*(.+)", text))
+
+
+def test_a_dead_process_is_covered_by_an_up_rule():
+    """
+    Regression, found by freezing the aggregator for 250 seconds.
+
+    `sum(rate(x[1m])) == 0` reads like "nothing is happening" but cannot match a
+    dead process: it publishes no series, the expression returns an empty
+    vector, and there is nothing for `== 0` to compare. The stall rule stayed
+    inactive for the whole outage. `up == 0` is what catches it.
+    """
+    assert any(expr.strip() == "up == 0" for expr in alert_expressions().values())
+
+
+def test_rate_zero_rules_carry_an_absent_arm():
+    """Same trap: a `rate(...) == 0` rule needs absent() to cover a vanished series."""
+    for name, expr in alert_expressions().items():
+        if "rate(" in expr and "== 0" in expr:
+            assert "absent(" in expr, f"{name} cannot fire when its series is gone"
+
+
+def test_every_alert_has_a_severity():
+    text = (OBSERVABILITY / "alerts.yml").read_text(encoding="utf-8")
+    assert text.count("- alert:") == text.count("severity:")

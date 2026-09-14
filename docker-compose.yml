@@ -77,8 +77,7 @@ services:
       context: .
       dockerfile: docker/Dockerfile
     command: python -m pipeline.api.server
-    ports:
-      - "8000:8000"
+    # No host port: everything is reached through the gateway below.
     depends_on:
       redis:
         condition: service_healthy
@@ -86,8 +85,21 @@ services:
       REDIS_HOST: redis
     restart: unless-stopped
 
+  # The single front door: the app at /, Grafana at /grafana/, Prometheus at
+  # /prometheus/. It only routes, so the monitoring views keep answering when
+  # the API they watch goes down.
+  gateway:
+    image: nginx:1.27-alpine
+    ports:
+      - "8000:80"
+    volumes:
+      - ./gateway/nginx.conf:/etc/nginx/conf.d/default.conf:ro
+    depends_on:
+      - api
+    restart: unless-stopped
+
   # --- Observability -------------------------------------------------------
-  # Behind a profile, so `docker compose up` stays a five-container stack.
+  # Behind a profile, so `docker compose up` stays a six-container stack.
   # Start it with: docker compose --profile obs up -d
   kafka-exporter:
     image: danielqsj/kafka-exporter:v1.7.0
@@ -111,8 +123,14 @@ services:
   prometheus:
     image: prom/prometheus:v2.55.1
     profiles: [obs]
-    ports:
-      - "9090:9090"
+    # Served internally at its root, so Grafana's datasource and the self-scrape
+    # keep plain URLs, while every link it generates carries /prometheus/ to
+    # match the gateway, which strips that prefix on the way in.
+    command:
+      - --config.file=/etc/prometheus/prometheus.yml
+      - --storage.tsdb.path=/prometheus
+      - --web.external-url=${PUBLIC_URL:-http://localhost:8000}/prometheus/
+      - --web.route-prefix=/
     volumes:
       - ./observability/prometheus.yml:/etc/prometheus/prometheus.yml:ro
       - ./observability/alerts.yml:/etc/prometheus/alerts.yml:ro
@@ -126,9 +144,11 @@ services:
   grafana:
     image: grafana/grafana:11.4.0
     profiles: [obs]
-    ports:
-      - "3000:3000"
     environment:
+      # Served from /grafana/ through the gateway. root_url must be the address
+      # the browser sees, or redirects and Grafana Live's origin check break.
+      GF_SERVER_ROOT_URL: ${PUBLIC_URL:-http://localhost:8000}/grafana/
+      GF_SERVER_SERVE_FROM_SUB_PATH: "true"
       # Anonymous viewing so the board opens without a login prompt; this is a
       # laptop demo, not a deployment.
       GF_AUTH_ANONYMOUS_ENABLED: "true"

@@ -72,6 +72,9 @@ jobs:
       - name: Wait for every Prometheus target to be up
         run: bash scripts/wait_for_targets.sh 6 30
 
+      - name: Check the gateway routes every UI
+        run: bash scripts/check_gateway.sh
+
       - name: Prometheus logs on failure
         if: failure()
         run: docker compose --profile obs logs --tail=40 prometheus

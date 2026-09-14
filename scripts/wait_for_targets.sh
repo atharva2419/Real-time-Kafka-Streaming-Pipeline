@@ -6,7 +6,7 @@
 #
 #   bash scripts/wait_for_targets.sh            # expect 6 targets, 30 attempts
 #   bash scripts/wait_for_targets.sh 8 60       # expect 8, wait longer
-#   PROMETHEUS_URL=http://host:9090 bash scripts/wait_for_targets.sh
+#   PROMETHEUS_URL=http://host:8000/prometheus bash scripts/wait_for_targets.sh
 #
 # On counting: the targets API returns all of its JSON on a single line, so
 # `grep -c` reports 1 no matter how many targets there are - it counts matching
@@ -15,7 +15,7 @@
 
 set -uo pipefail
 
-URL="${PROMETHEUS_URL:-http://localhost:9090}/api/v1/targets?state=active"
+URL="${PROMETHEUS_URL:-http://localhost:8000/prometheus}/api/v1/targets?state=active"
 EXPECTED="${1:-6}"
 ATTEMPTS="${2:-30}"
 SLEEP_SECONDS="${SLEEP_SECONDS:-5}"

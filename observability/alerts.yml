@@ -4,16 +4,32 @@
 groups:
   - name: pipeline
     rules:
+      # A dead process publishes no series at all, so a `rate() == 0` rule can
+      # never match it - the expression returns an empty vector and the alert
+      # stays inactive. Measured: an aggregator frozen for 250s left
+      # PipelineStalled inactive the whole time. `up == 0` is what actually
+      # catches a process that is down, frozen or unreachable.
+      - alert: TargetDown
+        expr: up == 0
+        for: 1m
+        labels: {severity: critical}
+        annotations:
+          summary: "{{ $labels.job }} is not scrapeable"
+          description: The process is down, frozen or unreachable. This is the rule that catches a dead aggregator or producer.
+
+      # Catches the other shape of failure: the process is alive and scrapeable
+      # but has stopped doing its job - Redis unreachable, or no input. The
+      # absent() arm covers the case where every aggregator has gone away.
       - alert: PipelineStalled
-        expr: sum(rate(wiki_windows_emitted_total[1m])) == 0
+        expr: sum(rate(wiki_windows_emitted_total[1m])) == 0 or absent(wiki_windows_emitted_total)
         for: 2m
         labels: {severity: critical}
         annotations:
           summary: No windows written for 2 minutes
-          description: The aggregator is not emitting. Check it is running and that Redis is reachable.
+          description: The aggregator is scrapeable but not emitting, or has disappeared entirely. Check Redis is reachable.
 
       - alert: NoEventsProduced
-        expr: sum(rate(wiki_events_produced_total[1m])) == 0
+        expr: sum(rate(wiki_events_produced_total[1m])) == 0 or absent(wiki_events_produced_total)
         for: 2m
         labels: {severity: critical}
         annotations:

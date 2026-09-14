@@ -16,7 +16,11 @@
   header { padding: 20px 24px; border-bottom: 1px solid var(--line);
            display: flex; align-items: baseline; gap: 16px; flex-wrap: wrap; }
   h1 { font-size: 17px; margin: 0; font-weight: 600; }
-  .status { margin-left: auto; font-size: 12px; color: var(--muted); }
+  .links { margin-left: auto; display: flex; gap: 16px; font-size: 12px; }
+  .links a { color: var(--muted); text-decoration: none; }
+  .links a:hover { color: var(--text); }
+  .links a.off { opacity: .45; cursor: help; }
+  .status { margin-left: 16px; font-size: 12px; color: var(--muted); }
   .dot { display: inline-block; width: 8px; height: 8px; border-radius: 50%;
          background: #3fb950; margin-right: 6px; vertical-align: middle; }
   .dot.down { background: #f85149; }
@@ -44,6 +48,10 @@
 <header>
   <h1>Wikimedia Edit Stream</h1>
   <span style="color:var(--muted);font-size:12px">5-second tumbling windows</span>
+  <nav class="links">
+    <a id="lnk-grafana" href="/grafana/d/wiki-stream/wiki-stream-pipeline" target="_blank" rel="noopener">Pipeline health ↗</a>
+    <a id="lnk-prometheus" href="/prometheus/alerts" target="_blank" rel="noopener">Alerts ↗</a>
+  </nav>
   <span class="status"><span class="dot" id="dot"></span><span id="conn">connecting…</span></span>
 </header>
 
@@ -166,6 +174,20 @@ function connect() {
 }
 
 connect();
+
+// The metrics stack is an optional Compose profile. Dim its links when it is not
+// running rather than let them lead to a dead end.
+async function probe(id, url) {
+  const link = document.getElementById(id);
+  try {
+    const res = await fetch(url, { cache: "no-store" });
+    if (res.ok) return;
+  } catch (_) { /* unreachable: fall through */ }
+  link.classList.add("off");
+  link.title = "Not running. Start it with: docker compose --profile obs up -d";
+}
+probe("lnk-grafana", "/grafana/api/health");
+probe("lnk-prometheus", "/prometheus/-/healthy");
 </script>
 </body>
 </html>

@@ -360,9 +360,66 @@ always outstanding. An alert on "lag > 0" would fire forever; the rule uses 2000
 The emit-delay figure is the first measurement of a number that had only been
 derived: grace (1 s) + poll (≤0.5 s) + write. Measured p99 is 1.5 s.
 
+### One front door, separate processes
+
+Grafana and Prometheus sit behind an nginx gateway at `/grafana/` and
+`/prometheus/`, so the whole stack is one address. They are not folded into the
+app, because a monitoring view must outlive the thing it monitors, and the
+gateway only routes. Stopping each piece in turn:
+
+| Stopped | `/` | `/grafana/` | `/prometheus/` |
+|---|---|---|---|
+| the API | 502 | 200 | 200 |
+| the obs profile | 200 | 503 + instructions | 503 + instructions |
+
+Three details that fail silently if they are wrong, each pinned by a test:
+
+- **Upstreams resolve per request.** A literal `proxy_pass http://grafana:3000`
+  is resolved at startup, so the gateway would refuse to boot whenever the obs
+  profile is off. A resolver plus variables defers the lookup.
+- **Headers are set at server level only.** nginx does not merge
+  `proxy_set_header`: a location that sets one header drops all the inherited
+  ones, including `Host`, which breaks Grafana's origin check.
+- **The two sub-path strategies are paired.** Grafana serves from `/grafana/`
+  itself, so nginx passes the prefix through; Prometheus serves from its root with
+  `--web.external-url`, so nginx strips it. Change one side without the other and
+  the UI loads with every asset path broken.
+
+One claim did not survive measurement. The config originally justified a long
+WebSocket read timeout by saying nginx's 60 s default would drop the dashboard
+socket during an outage. It would not: uvicorn pings every 20 s, which counts as
+traffic. With the timeout at its default, the socket stayed open through 90 s of
+application silence. The longer timeout stays as insurance for a server that
+does not ping, and the comment now says so.
+
+### A rule that could not fire
+
+The first stall rule was `sum(rate(wiki_windows_emitted_total[1m])) == 0`, which
+reads correctly and is wrong. A dead process publishes no series at all, so the
+expression returns an *empty vector* and there is nothing for `== 0` to match.
+Freezing the aggregator for 250 seconds left the alert `inactive` the entire
+time - it could not detect the one failure it was written for.
+
+`up == 0` is what catches a process that is down, frozen or unreachable, and it
+now leads the rule set as `TargetDown`. The stall rules keep their `rate() == 0`
+form, with an `absent()` arm, for the other shape of failure: alive and
+scrapeable, but no longer doing its job.
+
+Measured on the fixed rules, with the aggregator paused:
+
+| Elapsed | Lag | State |
+|---|---|---|
+| t+20s | 949 | `TargetDown` pending |
+| t+80s | 3,522 | `TargetDown` firing |
+| t+140s | 6,176 | `PipelineStalled` firing |
+| t+200s | 8,637 | `ConsumerLagHigh` firing |
+
+The general lesson is the same one §5 keeps repeating: an alert is a claim about
+a failure, and until the failure has been staged, it is an untested claim.
+
 ### What is missing
 
-No Alertmanager, so the seven rules are a working expression and a description
+No Alertmanager, so the eight rules are a working expression and a description
 rather than a page. No tracing - at this size, per-window structured logs carry
 more than spans would. And the API runs a single uvicorn worker, so the metrics
 registry needs no multiprocess mode; that assumption breaks if it is ever scaled

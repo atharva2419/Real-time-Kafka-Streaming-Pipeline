@@ -47,7 +47,10 @@ Wikimedia SSE firehose
   · /ws pushes each new window
          │
          ▼
-  Live dashboard at localhost:8000
+  gateway (nginx) — localhost:8000
+  · /              live edit dashboard
+  · /grafana/      pipeline health     ┐ with
+  · /prometheus/   alerts and queries  ┘ --profile obs
 ```
 
 ---
@@ -58,8 +61,8 @@ Wikimedia SSE firehose
 docker compose up -d --build
 ```
 
-That is the whole thing — Kafka, Redis, producer, aggregator and API. Health
-checks gate startup order, so nothing races the broker. Open
+That is the whole thing — Kafka, Redis, producer, aggregator, API and a gateway.
+Health checks gate startup order, so nothing races the broker. Open
 **http://localhost:8000**.
 
 Add metrics with a profile, which pulls in Prometheus, Grafana and two exporters:
@@ -68,16 +71,29 @@ Add metrics with a profile, which pulls in Prometheus, Grafana and two exporters
 docker compose --profile obs up -d --build
 ```
 
-- **http://localhost:3000** — Grafana, dashboard provisioned, no login needed
-- **http://localhost:9090/alerts** — Prometheus and its seven alert rules
+Everything is served from that one address:
+
+| Path | What |
+|---|---|
+| http://localhost:8000/ | the live edit dashboard |
+| http://localhost:8000/grafana/ | pipeline health board, provisioned, no login |
+| http://localhost:8000/prometheus/alerts | Prometheus and its eight alert rules |
+
+The dashboard header links to the other two, and dims those links when the
+`obs` profile isn't running.
 
 ```bash
-curl localhost:8000/healthz          # {"status":"ok","latest_window":...}
-curl localhost:8000/api/latest       # full window summary
-curl "localhost:8000/api/history?limit=20"
+curl http://localhost:8000/healthz          # {"status":"ok",...,"partitions":6}
+curl http://localhost:8000/api/latest       # full window summary
+curl "http://localhost:8000/api/history?limit=20"
 docker compose logs -f aggregator
 docker compose down -v
 ```
+
+> **Windows PowerShell:** `curl` there is an alias for `Invoke-WebRequest`, which
+> rejects a URL with no scheme and returns a response object rather than the body.
+> Use `curl.exe "http://..."` (bundled with Windows) or
+> `Invoke-RestMethod "http://..."`, which parses the JSON for you.
 
 ### Running it without Docker
 
@@ -118,7 +134,7 @@ bots are typically 40–50%.
 ## Testing
 
 ```bash
-pytest                    # 136 tests
+pytest                    # 139 tests
 pytest --cov              # 100% on window.py, offsets.py, sink.py, merge.py
 ruff check .
 mypy                      # clean across pipeline/ and tests/
@@ -133,37 +149,9 @@ CI runs lint and tests on Python 3.11 and 3.12, then builds the stack and blocks
 until `/healthz` reports a live window, so a broken pipeline fails the build
 rather than only a broken unit.
 
-### Reproducing the crash test
-
-```bash
-docker compose exec redis redis-cli FLUSHALL
-docker compose kill -s SIGKILL aggregator
-sleep 15
-docker compose start aggregator
-# then inspect wiki:history for gaps and duplicates
-```
-
-In `event` mode the history comes back fully contiguous with zero duplicates. In
-the default `arrival` mode nothing is lost either, but the replayed backlog
-lands in the window open at restart — a hole plus one inflated window. Why, and
-which you want, is [§3 of the design notes](docs/DESIGN.md).
-
-### Scaling the aggregator
-
-```bash
-docker compose up -d --scale aggregator=2
-docker compose logs aggregator | grep edits    # each replica logs its own share
-curl localhost:8000/api/latest                 # the API serves the merged window
-```
-
-Kafka splits the six partitions across the group, and each replica writes only
-the Redis fields for the partitions it owns, so their work composes rather than
-collides. Measured with two replicas: 20 + 199 = 219, 11 + 228 = 239,
-12 + 231 = 243 — the merged totals match the replicas' own logs exactly.
-
-This did not use to work. Both replicas wrote the same key and the last one won,
-silently undercounting every window; [§5.3 of the design
-notes](docs/DESIGN.md) has the numbers and the fix.
+The sink tests use Redis database 15, not the 0 the pipeline runs on, because
+their fixtures delete every window key they touch — sharing db 0 with a running
+stack silently wiped the live dashboard's history.
 
 ---
 
@@ -197,7 +185,14 @@ Three decisions behind it worth knowing:
 
 Consumer lag never sits at zero, and that is by design: offsets are not
 committed until the window they fed has been written, so a steady baseline of
-roughly one window per partition is the system working correctly.
+roughly one window per partition is the system working correctly. An alert on
+"lag > 0" would fire forever; the rule uses 2000.
+
+Reading the board: the top row is four headline numbers, the rows below are the
+same signals over time. Every panel carries an ⓘ describing what it shows and
+what normal looks like. The one to know is *Consumer lag by partition* — P3 and
+P5 ride far above the rest because keying by wiki puts 86% of the traffic there.
+The Demos section below makes the whole board move.
 
 Scrape targets are discovered by DNS, so `--scale aggregator=3` is picked up
 with no config change. To check the stack is fully wired:
@@ -208,6 +203,122 @@ bash scripts/wait_for_targets.sh      # blocks until all 6 targets scrape clean
 
 CI runs that same script, so a broken metrics config fails the build rather than
 silently producing an empty dashboard.
+
+### One front door, separate processes
+
+Grafana and Prometheus are reached through an nginx gateway at `/grafana/` and
+`/prometheus/` rather than on ports of their own, but they are deliberately not
+folded into the app. A monitoring view has to keep working when the thing it
+watches breaks, and the gateway only routes. Measured:
+
+| Stopped | `/` | `/grafana/` | `/prometheus/` |
+|---|---|---|---|
+| nothing | 200 | 200 | 200 |
+| the API | **502** | 200 | 200 |
+| the obs profile | 200 | 503, with the command to start it | 503, with the command to start it |
+
+```bash
+bash scripts/check_gateway.sh      # every route answers, and /metrics stays hidden
+```
+
+The gateway resolves its upstreams per request instead of at startup, which is
+why it boots happily without the obs profile rather than refusing to start over
+a hostname it can't find.
+
+---
+
+## Demos
+
+Three things worth showing, in the order that tells the best story. Each one is
+reversible and none of them lose data.
+
+### 1. Watch it fall behind, then catch up
+
+Open Grafana first, then freeze the consumer while the producer keeps running:
+
+```bash
+docker compose pause aggregator     # SIGSTOP — frozen, not killed
+# watch for ~90 seconds, then
+docker compose unpause aggregator
+```
+
+**Consume rate** drops to zero while ingest carries on unchanged, and
+**consumer lag** climbs at the ingest rate. Watching
+[localhost:8000/prometheus/alerts](http://localhost:8000/prometheus/alerts) alongside, a measured run:
+
+| Elapsed | Lag | Alerts |
+|---|---|---|
+| t+20s | 949 | `TargetDown` pending |
+| t+80s | 3,522 | **`TargetDown` firing** |
+| t+140s | 6,176 | **`PipelineStalled` firing** |
+| t+200s | 8,637 | **`ConsumerLagHigh` firing** |
+| unpause | 8,637 → 205 in ~25s | all resolve |
+
+So a 90-second pause is enough to show lag climbing and the first alert firing;
+give it three and a half minutes to see all three.
+
+The detail worth pointing at: while the aggregator is frozen, its own `/metrics`
+target goes **down** — and the lag graph keeps updating anyway. Lag is read from
+the broker by `kafka-exporter` precisely so that it outlives the thing it
+measures.
+
+`TargetDown` exists because of a bug this demo found. The original stall rule
+was `sum(rate(wiki_windows_emitted_total[1m])) == 0`, which cannot match a *dead*
+process: no series, empty vector, nothing to compare to zero. A frozen aggregator
+left it `inactive` for 250 seconds. `up == 0` catches the process being gone;
+the stall rule now also carries an `absent()` arm and covers the other shape of
+failure — alive and scrapeable, but not emitting.
+
+### 2. Crash recovery
+
+`SIGKILL` skips every shutdown path, so this is a real crash rather than a clean
+stop:
+
+```bash
+docker compose kill -s SIGKILL aggregator
+sleep 15
+docker compose start aggregator
+curl "http://localhost:8000/api/history?limit=30"
+```
+
+History comes back with **no duplicate timestamps** and a gap the length of the
+downtime. In the default `arrival` mode the replayed backlog lands in the window
+open at restart, so there is also one inflated window — a measured run gave 1055
+edits against a median of 201. In `event` mode the backlog is reattributed to its
+original windows and history is fully contiguous instead. Which you want, and
+why, is [§3 of the design notes](docs/DESIGN.md).
+
+`docker compose kill` leaves the container exited: the `unless-stopped` restart
+policy does not resurrect it, so the explicit `start` is required.
+
+### 3. Scale out
+
+```bash
+docker compose up -d --scale aggregator=2
+docker compose logs aggregator | grep edits    # each replica logs its own share
+curl http://localhost:8000/api/latest          # the API serves the merged window
+docker compose up -d --scale aggregator=1      # back to one
+```
+
+Kafka splits the six partitions across the group, and each replica writes only
+the Redis fields for the partitions it owns, so their work composes rather than
+collides. Measured with two replicas: 20 + 199 = 219, 11 + 228 = 239,
+12 + 231 = 243 — the merged totals match the replicas' own logs exactly, and
+"partitions covered" on the Grafana board stays at 6 throughout.
+
+This did not use to work. Both replicas wrote the same key and the last one won,
+silently undercounting every window; [§5.3 of the design
+notes](docs/DESIGN.md) has the numbers and the fix.
+
+### Which interruption to use
+
+| Command | Signal | Container | Good for |
+|---|---|---|---|
+| `pause` / `unpause` | SIGSTOP | frozen, still up | the lag demo — instant and reversible |
+| `stop` / `start` | SIGTERM, then KILL after 10s | exits cleanly | the graceful path: flushes and logs its counters |
+| `kill -s SIGKILL` | SIGKILL | exits immediately | the crash test — no cleanup, forces a replay |
+
+All three need an explicit `start` or `unpause` afterwards.
 
 ---
 
@@ -230,7 +341,9 @@ Every setting is an environment variable; see [.env.example](.env.example).
 ## Project layout
 
 ```
+gateway/nginx.conf         single front door: /, /grafana/, /prometheus/
 observability/            Prometheus config, alert rules, Grafana dashboard
+scripts/                   stack checks, run by CI and runnable by hand
 pipeline/
 ├── config.py              env-driven configuration
 ├── merge.py               summing per-partition window slices
@@ -244,7 +357,7 @@ pipeline/
 └── api/
     ├── server.py          FastAPI: REST + WebSocket
     └── static/index.html  dashboard
-tests/                     136 tests
+tests/                     139 tests
 docs/DESIGN.md             semantics, trade-offs, measurements
 docker/Dockerfile          one image, three entrypoints
 ```
