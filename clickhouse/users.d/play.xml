@@ -1,0 +1,36 @@
+<clickhouse>
+    <profiles>
+        <!--
+            readonly=2 allows SELECT and SET, but no INSERT, no DDL and no
+            dropping tables. The limits keep one careless query in the browser
+            console from taking the server down.
+        -->
+        <play_readonly>
+            <readonly>2</readonly>
+            <max_execution_time>30</max_execution_time>
+            <max_result_rows>100000</max_result_rows>
+            <max_result_bytes>100000000</max_result_bytes>
+            <max_memory_usage>2000000000</max_memory_usage>
+        </play_readonly>
+    </profiles>
+
+    <users>
+        <!--
+            The gateway rewrites every request to /clickhouse/ to run as this
+            user, whatever the console's own credential boxes say, so the SQL
+            console on the front door cannot write or drop anything.
+
+            The `default` user still exists for the Kafka engine, the API and
+            the tests, and is reachable only from inside the Compose network or
+            through the published port on localhost.
+        -->
+        <play>
+            <password></password>
+            <profile>play_readonly</profile>
+            <quota>default</quota>
+            <networks>
+                <ip>::/0</ip>
+            </networks>
+        </play>
+    </users>
+</clickhouse>

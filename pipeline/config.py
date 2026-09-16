@@ -72,6 +72,15 @@ USER_AGENT = _str(
 )
 PRINT_EVERY = _int("PRINT_EVERY", 500)
 
+# --- ClickHouse (cold path) ----------------------------------------------
+# The API and the tests talk to ClickHouse over HTTP as `default`. The browser
+# SQL console goes through the gateway, which forces a read-only user instead.
+CLICKHOUSE_HOST = _str("CLICKHOUSE_HOST", "localhost")
+CLICKHOUSE_PORT = _int("CLICKHOUSE_PORT", 8123)
+CLICKHOUSE_DB = _str("CLICKHOUSE_DB", "wiki")
+CLICKHOUSE_USER = _str("CLICKHOUSE_USER", "default")
+CLICKHOUSE_PASSWORD = _str("CLICKHOUSE_PASSWORD", "")
+
 # --- Observability -------------------------------------------------------
 # The producer and aggregator are not HTTP servers, so each exposes /metrics on
 # its own port for Prometheus to scrape. The API serves its own route.

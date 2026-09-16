@@ -49,7 +49,7 @@ def service(name: str) -> str:
 
 def test_every_ui_has_a_route():
     locations = location_bodies()
-    for path in ("/grafana/", "/prometheus/", "/ws", "/"):
+    for path in ("/grafana/", "/prometheus/", "/clickhouse/", "/ws", "/"):
         assert path in locations, f"no location for {path}"
 
 
@@ -77,20 +77,75 @@ def test_missing_obs_profile_gets_an_explanation_not_a_bare_502():
     for path in ("/grafana/", "/prometheus/"):
         assert "@obs_not_running" in locations[path], path
     assert "--profile obs" in locations["@obs_not_running"]
+    assert "@clickhouse_not_running" in locations["/clickhouse/"]
+    assert "docker compose up -d clickhouse" in locations["@clickhouse_not_running"]
 
 
 # ---------------------------------------------------------------------------
 # The nginx footgun
 # ---------------------------------------------------------------------------
 
-def test_proxy_headers_are_set_only_at_server_level():
+def server_level_headers() -> set[str]:
+    conf = nginx()
+    head = conf[: conf.index("location")]
+    return set(re.findall(r"proxy_set_header\s+(\S+)", head))
+
+
+def test_a_location_that_sets_headers_redeclares_every_inherited_one():
     """
     nginx does not merge proxy_set_header across levels: a location that sets
     even one header silently drops every server-level one, including Host, which
     breaks Grafana's origin check with no error in the config.
+
+    One location has to set headers - /clickhouse/ forces the read-only user -
+    so the rule is not "never set them in a location" but "if you do, repeat
+    all of them".
     """
+    inherited = server_level_headers()
+    assert inherited, "no server-level proxy_set_header found"
+
     for path, body in location_bodies().items():
-        assert "proxy_set_header" not in body, f"location {path} would drop server headers"
+        own = set(re.findall(r"proxy_set_header\s+(\S+)", body))
+        if not own:
+            continue
+        missing = inherited - own
+        assert not missing, f"location {path} drops inherited headers: {sorted(missing)}"
+
+
+def test_the_sql_console_is_pinned_to_a_read_only_user():
+    """
+    The obvious way to force the user - an X-ClickHouse-User header on the
+    location - breaks the console outright. play.html always sends
+    ?user=&password= from its credential boxes, and ClickHouse refuses any
+    request carrying both an X-ClickHouse-* header and parameter credentials:
+    "it is not allowed to use X-ClickHouse HTTP headers and authentication via
+    parameters simultaneously". Measured: console loads, every query fails.
+
+    So the user is pinned in the link instead, and `play` is readonly=2, which
+    is what actually prevents writes.
+    """
+    conf = nginx()
+    assert "X-ClickHouse-User" not in conf, "forcing the user by header breaks the console"
+
+    redirect = location_bodies()["= /clickhouse"]
+    assert "user=play" in redirect
+    # Absolute, because play.html runs `new URL(url)` on it and a bare path throws.
+    assert "url=$scheme://$http_host/clickhouse/" in redirect
+
+    users = (ROOT / "clickhouse" / "users.d" / "play.xml").read_text(encoding="utf-8")
+    assert "<readonly>2</readonly>" in users
+
+
+def test_the_console_health_probe_is_answered_at_the_origin_root():
+    """
+    play.html pings `new URL(url).origin + "?query"` with OPTIONS - it discards
+    the sub-path, so behind this gateway the probe lands on the app. Queries
+    themselves use the full path and work, but the status dot stays red and the
+    schema tree never loads, because both are gated behind that ping.
+    """
+    root = location_bodies()["= /"]
+    assert "$request_method = OPTIONS" in root
+    assert "return 204" in root
 
 
 def test_websocket_upgrade_is_forwarded():

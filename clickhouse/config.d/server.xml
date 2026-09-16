@@ -1,0 +1,19 @@
+<clickhouse>
+    <!--
+        ClickHouse sizes its caches against total system RAM and assumes it owns
+        the machine. This one shares a laptop with Kafka, Redis, Prometheus and
+        Grafana, so it is told to take a fraction rather than most of it.
+    -->
+    <max_server_memory_usage_to_ram_ratio>0.3</max_server_memory_usage_to_ram_ratio>
+    <mark_cache_size>268435456</mark_cache_size>
+    <uncompressed_cache_size>268435456</uncompressed_cache_size>
+
+    <!--
+        The default level narrates every merge and every part, which drowns
+        `docker compose logs` for a dataset this size.
+    -->
+    <logger>
+        <level>warning</level>
+        <console>true</console>
+    </logger>
+</clickhouse>

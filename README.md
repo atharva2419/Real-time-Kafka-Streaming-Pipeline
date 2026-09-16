@@ -78,6 +78,7 @@ Everything is served from that one address:
 | http://localhost:8000/ | the live edit dashboard |
 | http://localhost:8000/grafana/ | pipeline health board, provisioned, no login |
 | http://localhost:8000/prometheus/alerts | Prometheus and its eight alert rules |
+| http://localhost:8000/clickhouse | SQL console over the cold path, read-only |
 
 The dashboard header links to the other two, and dims those links when the
 `obs` profile isn't running.

@@ -51,6 +51,7 @@
   <nav class="links">
     <a id="lnk-grafana" href="/grafana/d/wiki-stream/wiki-stream-pipeline" target="_blank" rel="noopener">Pipeline health ↗</a>
     <a id="lnk-prometheus" href="/prometheus/alerts" target="_blank" rel="noopener">Alerts ↗</a>
+    <a id="lnk-clickhouse" href="/clickhouse" target="_blank" rel="noopener">SQL console ↗</a>
   </nav>
   <span class="status"><span class="dot" id="dot"></span><span id="conn">connecting…</span></span>
 </header>
@@ -188,6 +189,7 @@ async function probe(id, url) {
 }
 probe("lnk-grafana", "/grafana/api/health");
 probe("lnk-prometheus", "/prometheus/-/healthy");
+probe("lnk-clickhouse", "/clickhouse/ping");
 </script>
 </body>
 </html>

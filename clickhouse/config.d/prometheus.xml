@@ -1,0 +1,15 @@
+<clickhouse>
+    <!--
+        ClickHouse exposes its own metrics; Prometheus scrapes this endpoint
+        alongside the application's. Port 9363 is internal to the Compose
+        network - nothing publishes it to the host.
+    -->
+    <prometheus>
+        <endpoint>/metrics</endpoint>
+        <port>9363</port>
+        <metrics>true</metrics>
+        <events>true</events>
+        <asynchronous_metrics>true</asynchronous_metrics>
+        <errors>true</errors>
+    </prometheus>
+</clickhouse>
