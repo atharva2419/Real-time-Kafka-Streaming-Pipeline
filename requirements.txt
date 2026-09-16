@@ -7,3 +7,6 @@ fastapi==0.115.6
 uvicorn[standard]==0.34.0
 python-dotenv==1.0.1
 prometheus-client==0.21.1
+# [async] pulls in aiohttp: 1.x's async client is a real async client, not a
+# thread-pool wrapper, and fails to import without it.
+clickhouse-connect[async]==1.8.0

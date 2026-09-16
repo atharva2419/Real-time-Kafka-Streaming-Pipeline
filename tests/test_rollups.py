@@ -9,57 +9,25 @@ loaded: it would start a real consumer against the real topic.
 Skipped automatically when ClickHouse is not reachable: `docker compose up -d clickhouse`.
 """
 
-import pathlib
-import re
-
 import pytest
-import requests
 
-from pipeline import config
+from tests import _clickhouse as ch
+from tests._clickhouse import q
 
-INIT = pathlib.Path(__file__).resolve().parents[1] / "clickhouse" / "init"
 DB = "wiki_test"
-CH = f"http://{config.CLICKHOUSE_HOST}:{config.CLICKHOUSE_PORT}/"
-
-
-def q(sql: str) -> str:
-    response = requests.post(CH, data=sql.encode(), timeout=30)
-    if response.status_code != 200:
-        raise AssertionError(f"ClickHouse error for:\n{sql}\n\n{response.text}")
-    return response.text.strip()
-
-
-def statements(filename: str) -> list[str]:
-    """One init file, retargeted at the test database, split into statements."""
-    text = re.sub(r"--[^\n]*", "", (INIT / filename).read_text(encoding="utf-8"))
-    text = re.sub(r"DATABASE IF NOT EXISTS wiki\b", f"DATABASE IF NOT EXISTS {DB}", text)
-    text = re.sub(r"\bwiki\.", f"{DB}.", text)
-    return [s.strip() for s in text.split(";") if s.strip()]
 
 
 @pytest.fixture(scope="module")
 def clickhouse():
-    try:
-        requests.get(CH + "ping", timeout=1).raise_for_status()
-    except requests.RequestException as exc:
-        pytest.skip(
-            f"ClickHouse not reachable at {CH} ({type(exc).__name__}) - "
-            "run `docker compose up -d clickhouse`",
-            allow_module_level=True,
-        )
-
-    q(f"DROP DATABASE IF EXISTS {DB} SYNC")
-    for filename in ("01_raw.sql", "02_rollups.sql"):
-        for stmt in statements(filename):
-            q(stmt)
+    ch.require_clickhouse()
+    ch.create_schema(DB)
     yield
-    q(f"DROP DATABASE IF EXISTS {DB} SYNC")
+    ch.drop(DB)
 
 
 @pytest.fixture
 def db(clickhouse):
-    for table in ("edits", "edits_1m", "edits_1d"):
-        q(f"TRUNCATE TABLE {DB}.{table}")
+    ch.truncate(DB)
     yield
 
 

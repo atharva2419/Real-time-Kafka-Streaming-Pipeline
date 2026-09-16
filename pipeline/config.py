@@ -80,6 +80,10 @@ CLICKHOUSE_PORT = _int("CLICKHOUSE_PORT", 8123)
 CLICKHOUSE_DB = _str("CLICKHOUSE_DB", "wiki")
 CLICKHOUSE_USER = _str("CLICKHOUSE_USER", "default")
 CLICKHOUSE_PASSWORD = _str("CLICKHOUSE_PASSWORD", "")
+# Short on purpose: the analytics routes should fail fast with a 503 rather
+# than hold a request open while ClickHouse is unreachable.
+CLICKHOUSE_CONNECT_TIMEOUT = _int("CLICKHOUSE_CONNECT_TIMEOUT", 2)
+CLICKHOUSE_QUERY_TIMEOUT = _int("CLICKHOUSE_QUERY_TIMEOUT", 10)
 
 # --- Observability -------------------------------------------------------
 # The producer and aggregator are not HTTP servers, so each exposes /metrics on

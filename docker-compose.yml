@@ -118,11 +118,14 @@ services:
       dockerfile: docker/Dockerfile
     command: python -m pipeline.api.server
     # No host port: everything is reached through the gateway below.
+    # Deliberately no dependency on clickhouse: the live dashboard must keep
+    # working when the cold path is down, and the analytics routes answer 503.
     depends_on:
       redis:
         condition: service_healthy
     environment:
       REDIS_HOST: redis
+      CLICKHOUSE_HOST: clickhouse
     restart: unless-stopped
 
   # The single front door: the app at /, Grafana at /grafana/, Prometheus at

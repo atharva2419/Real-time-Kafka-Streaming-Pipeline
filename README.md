@@ -96,6 +96,31 @@ docker compose down -v
 > Use `curl.exe "http://..."` (bundled with Windows) or
 > `Invoke-RestMethod "http://..."`, which parses the JSON for you.
 
+### Analytics API
+
+The live routes above read Redis: the last ten minutes. These read ClickHouse,
+which keeps a week of raw events and months of rollups.
+
+| Route | Answers | Reads |
+|---|---|---|
+| `GET /api/analytics/timeline?range=24h&bucket=1h` | edits, bots, new pages, editors per bucket | minute or daily rollup |
+| `GET /api/analytics/top-wikis?range=7d&limit=10` | busiest wikis over a rolling window | minute rollup |
+| `GET /api/analytics/top-editors?range=24h&limit=10` | most active editors | raw events |
+
+`range` is one of `1h 6h 24h 7d 30d 90d`; `bucket` one of `1m 5m 1h 1d`. A request
+that can't be answered as asked is a **400 with the reason** — `30d` at `1m` is
+43,200 points, top editors past raw retention would be silently partial — and
+every value reaches ClickHouse as a bound parameter, never as SQL text.
+
+A missing bucket in a timeline means the pipeline wasn't running, not that
+Wikipedia had no edits; gaps are reported, not filled with zeros.
+
+The two paths fail independently. With ClickHouse stopped, the analytics routes
+return **503** while the dashboard, the live routes and `/healthz` stay 200; start
+it again and the analytics recover on the next request, with no API restart.
+`/healthz` reports the cold path under `cold_path` without letting it decide the
+verdict.
+
 ### Running it without Docker
 
 ```bash
@@ -135,7 +160,7 @@ bots are typically 40–50%.
 ## Testing
 
 ```bash
-pytest                    # 139 tests
+pytest                    # 229 tests
 pytest --cov              # 100% on window.py, offsets.py, sink.py, merge.py
 ruff check .
 mypy                      # clean across pipeline/ and tests/
@@ -343,11 +368,17 @@ Every setting is an environment variable; see [.env.example](.env.example).
 ## Project layout
 
 ```
-gateway/nginx.conf         single front door: /, /grafana/, /prometheus/
+gateway/nginx.conf         single front door: /, /grafana/, /prometheus/, /clickhouse/
+clickhouse/
+├── init/01_raw.sql        raw events (7d) and the dead-letter table
+├── init/02_rollups.sql    per-minute (90d) and per-day rollups
+├── init/03_kafka_source.sql  Kafka engine ingest - must sort last
+├── config.d/, users.d/    metrics endpoint, memory cap, read-only console user
 observability/            Prometheus config, alert rules, Grafana dashboard
 scripts/                   stack checks, run by CI and runnable by hand
 pipeline/
 ├── config.py              env-driven configuration
+├── analytics.py           cold-path queries, validated and parameter-bound
 ├── merge.py               summing per-partition window slices
 ├── metrics.py             Prometheus metric definitions
 ├── producer/produce.py    SSE -> Kafka, keyed by wiki
@@ -357,9 +388,9 @@ pipeline/
 │   ├── sink.py            idempotent, partition-scoped Redis writer (Lua)
 │   └── aggregator.py      the consume loop, window state per partition
 └── api/
-    ├── server.py          FastAPI: REST + WebSocket
+    ├── server.py          FastAPI: live and analytics routes, WebSocket
     └── static/index.html  dashboard
-tests/                     139 tests
+tests/                     229 tests
 docs/DESIGN.md             semantics, trade-offs, measurements
 docker/Dockerfile          one image, three entrypoints
 ```

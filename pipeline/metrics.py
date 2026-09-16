@@ -118,6 +118,16 @@ redis_read_seconds = Histogram(
     ["op"],
     buckets=(0.001, 0.0025, 0.005, 0.01, 0.025, 0.05, 0.1, 0.5),
 )
+clickhouse_query_seconds = Histogram(
+    "wiki_api_clickhouse_query_seconds",
+    "Duration of a ClickHouse query served by the analytics routes.",
+    ["query"],
+    buckets=(0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 10.0),
+)
+cold_path_unavailable = Counter(
+    "wiki_api_cold_path_unavailable",
+    "Analytics requests answered 503 because ClickHouse could not be reached.",
+)
 
 
 # ---------------------------------------------------------------------------
