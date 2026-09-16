@@ -75,6 +75,9 @@ jobs:
       - name: Check the gateway routes every UI
         run: bash scripts/check_gateway.sh
 
+      - name: Check the cold path is ingesting
+        run: bash scripts/check_cold_path.sh
+
       - name: Prometheus logs on failure
         if: failure()
         run: docker compose --profile obs logs --tail=40 prometheus

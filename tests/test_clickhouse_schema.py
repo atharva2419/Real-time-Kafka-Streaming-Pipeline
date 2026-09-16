@@ -69,11 +69,14 @@ def test_init_creates_the_database():
 
 def test_init_is_rerunnable():
     """The volume outlives a container; every statement has to tolerate that."""
-    body = sql("01_raw.sql")
-    creates = re.findall(r"CREATE (?:TABLE|DATABASE)(?: IF NOT EXISTS)?", body)
-    assert creates, "no CREATE statements found"
-    for create in creates:
-        assert "IF NOT EXISTS" in create, create
+    for path in sorted(INIT.glob("*.sql")):
+        body = sql(path.name)
+        creates = re.findall(
+            r"CREATE (?:TABLE|DATABASE|MATERIALIZED VIEW)(?: IF NOT EXISTS)?", body
+        )
+        assert creates, f"no CREATE statements in {path.name}"
+        for create in creates:
+            assert "IF NOT EXISTS" in create, f"{path.name}: {create}"
 
 
 # ---------------------------------------------------------------------------
@@ -152,3 +155,90 @@ def test_dead_letter_table_keeps_the_raw_message_and_the_error():
 def test_dead_letter_table_expires_too():
     errors = statement("01_raw.sql", "wiki.edits_errors")
     assert re.search(r"TTL .*INTERVAL 30 DAY", errors)
+
+
+# ---------------------------------------------------------------------------
+# Ingest: the Kafka engine table and its materialized views
+# ---------------------------------------------------------------------------
+
+def view(name: str, view_name: str) -> str:
+    body = sql(name)
+    start = body.index(f"CREATE MATERIALIZED VIEW IF NOT EXISTS {view_name}")
+    return body[start: body.index(";", start)]
+
+
+def setting(queue: str, key: str) -> str:
+    match = re.search(rf"{key}\s*=\s*'?([^',\s]+)'?", queue)
+    assert match, f"{key} not set"
+    return match.group(1)
+
+
+def test_clickhouse_does_not_join_the_aggregators_consumer_group():
+    """
+    The most damaging misconfiguration available here, and it fails silently.
+    Sharing `wiki-aggregator` would make Kafka split the six partitions between
+    the two consumers, and each path would quietly see only part of the stream.
+    Measured with separate groups: both own all six partitions.
+    """
+    from pipeline import config
+
+    queue = statement("02_kafka_source.sql", "wiki.edits_queue")
+    assert setting(queue, "kafka_group_name") != config.CONSUMER_GROUP
+
+
+def test_reads_the_topic_the_producer_writes():
+    from pipeline import config
+
+    queue = statement("02_kafka_source.sql", "wiki.edits_queue")
+    assert setting(queue, "kafka_topic_list") == config.KAFKA_TOPIC
+
+
+def test_broker_address_is_the_internal_listener():
+    """localhost:9092 inside the ClickHouse container is ClickHouse itself."""
+    queue = statement("02_kafka_source.sql", "wiki.edits_queue")
+    assert setting(queue, "kafka_broker_list") == "kafka:29092"
+
+
+def test_parse_errors_are_streamed_not_thrown():
+    """
+    The default throws on a bad message and stalls the consumer. `stream` turns
+    it into a row carrying _error and _raw_message instead.
+    """
+    queue = statement("02_kafka_source.sql", "wiki.edits_queue")
+    assert setting(queue, "kafka_handle_error_mode") == "stream"
+
+
+def test_queue_nullability_matches_the_raw_table():
+    """
+    A field that is Nullable in wiki.edits but not in the queue would still fail
+    at parse time - measured: 16,813 null-id log events landed only because both
+    agree.
+    """
+    queue = statement("02_kafka_source.sql", "wiki.edits_queue")
+    for column in ("id", "title", "user", "timestamp"):
+        assert re.search(rf"`?{column}`?\s+Nullable\(", queue), f"{column} must be Nullable"
+
+
+def test_every_message_lands_in_exactly_one_table():
+    """The two views' filters are complements, so nothing is dropped or doubled."""
+    clean = view("02_kafka_source.sql", "wiki.edits_mv")
+    errors = view("02_kafka_source.sql", "wiki.edits_errors_mv")
+    assert "TO wiki.edits AS" in clean and "WHERE length(_error) = 0" in clean
+    assert "TO wiki.edits_errors AS" in errors and "WHERE length(_error) > 0" in errors
+
+
+def test_only_materialized_views_read_the_queue():
+    """
+    Reading a Kafka engine table consumes from it and advances the offsets, so
+    any other SELECT would silently steal rows from the pipeline.
+    """
+    for path in sorted(INIT.glob("*.sql")):
+        for stmt in sql(path.name).split(";"):
+            if "FROM wiki.edits_queue" in stmt:
+                assert "CREATE MATERIALIZED VIEW" in stmt, f"{path.name} reads the queue directly"
+
+
+def test_ingest_time_comes_from_the_broker():
+    clean = view("02_kafka_source.sql", "wiki.edits_mv")
+    assert "_timestamp_ms" in clean
+    assert "_partition" in clean and "_offset" in clean

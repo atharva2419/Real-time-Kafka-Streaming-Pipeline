@@ -220,6 +220,7 @@ watches breaks, and the gateway only routes. Measured:
 
 ```bash
 bash scripts/check_gateway.sh      # every route answers, and /metrics stays hidden
+bash scripts/check_cold_path.sh    # rows landing in ClickHouse, fresh, nothing dead-lettered
 ```
 
 The gateway resolves its upstreams per request instead of at startup, which is
