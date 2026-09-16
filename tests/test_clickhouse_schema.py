@@ -182,20 +182,20 @@ def test_clickhouse_does_not_join_the_aggregators_consumer_group():
     """
     from pipeline import config
 
-    queue = statement("02_kafka_source.sql", "wiki.edits_queue")
+    queue = statement("03_kafka_source.sql", "wiki.edits_queue")
     assert setting(queue, "kafka_group_name") != config.CONSUMER_GROUP
 
 
 def test_reads_the_topic_the_producer_writes():
     from pipeline import config
 
-    queue = statement("02_kafka_source.sql", "wiki.edits_queue")
+    queue = statement("03_kafka_source.sql", "wiki.edits_queue")
     assert setting(queue, "kafka_topic_list") == config.KAFKA_TOPIC
 
 
 def test_broker_address_is_the_internal_listener():
     """localhost:9092 inside the ClickHouse container is ClickHouse itself."""
-    queue = statement("02_kafka_source.sql", "wiki.edits_queue")
+    queue = statement("03_kafka_source.sql", "wiki.edits_queue")
     assert setting(queue, "kafka_broker_list") == "kafka:29092"
 
 
@@ -204,7 +204,7 @@ def test_parse_errors_are_streamed_not_thrown():
     The default throws on a bad message and stalls the consumer. `stream` turns
     it into a row carrying _error and _raw_message instead.
     """
-    queue = statement("02_kafka_source.sql", "wiki.edits_queue")
+    queue = statement("03_kafka_source.sql", "wiki.edits_queue")
     assert setting(queue, "kafka_handle_error_mode") == "stream"
 
 
@@ -214,15 +214,15 @@ def test_queue_nullability_matches_the_raw_table():
     at parse time - measured: 16,813 null-id log events landed only because both
     agree.
     """
-    queue = statement("02_kafka_source.sql", "wiki.edits_queue")
+    queue = statement("03_kafka_source.sql", "wiki.edits_queue")
     for column in ("id", "title", "user", "timestamp"):
         assert re.search(rf"`?{column}`?\s+Nullable\(", queue), f"{column} must be Nullable"
 
 
 def test_every_message_lands_in_exactly_one_table():
     """The two views' filters are complements, so nothing is dropped or doubled."""
-    clean = view("02_kafka_source.sql", "wiki.edits_mv")
-    errors = view("02_kafka_source.sql", "wiki.edits_errors_mv")
+    clean = view("03_kafka_source.sql", "wiki.edits_mv")
+    errors = view("03_kafka_source.sql", "wiki.edits_errors_mv")
     assert "TO wiki.edits AS" in clean and "WHERE length(_error) = 0" in clean
     assert "TO wiki.edits_errors AS" in errors and "WHERE length(_error) > 0" in errors
 
@@ -239,6 +239,61 @@ def test_only_materialized_views_read_the_queue():
 
 
 def test_ingest_time_comes_from_the_broker():
-    clean = view("02_kafka_source.sql", "wiki.edits_mv")
+    clean = view("03_kafka_source.sql", "wiki.edits_mv")
     assert "_timestamp_ms" in clean
     assert "_partition" in clean and "_offset" in clean
+
+
+# ---------------------------------------------------------------------------
+# Rollups
+# ---------------------------------------------------------------------------
+
+def test_ingest_source_is_created_after_every_view_on_raw_events():
+    """
+    A materialized view only sees inserts made after it exists, and the Kafka
+    source starts consuming the moment it is created - on first boot, a backfill
+    of everything Kafka holds. Any view on wiki.edits created later misses all
+    of it for good. Init files run in name order, so the ingest file must sort
+    after every file that defines such a view.
+    """
+    files = sorted(INIT.glob("*.sql"))
+    ingest = [f for f in files if "ENGINE = Kafka" in sql(f.name)]
+    assert len(ingest) == 1, ingest
+
+    views_on_raw = [
+        f for f in files
+        if re.search(r"CREATE MATERIALIZED VIEW[^;]*FROM wiki\.edits\b(?!_)", sql(f.name))
+    ]
+    assert views_on_raw, "no views on wiki.edits found"
+    for f in views_on_raw:
+        assert f.name < ingest[0].name, f"{f.name} would miss the backfill from {ingest[0].name}"
+
+
+def test_daily_rollup_is_chained_off_the_minute_rollup():
+    """A view fires on inserts into its own source; the 1d view must read edits_1m."""
+    daily = view("02_rollups.sql", "wiki.edits_1d_mv")
+    assert "FROM wiki.edits_1m" in daily
+    assert "uniqMergeState(editors)" in daily
+
+
+def test_minute_rollup_keeps_a_mergeable_sketch_of_editors():
+    minute = view("02_rollups.sql", "wiki.edits_1m_mv")
+    assert "uniqState(`user`)" in minute
+
+
+def test_editor_state_types_match_across_both_rollups():
+    """uniqMergeState must produce exactly the type the daily table declares."""
+    for table in ("wiki.edits_1m", "wiki.edits_1d"):
+        body = statement("02_rollups.sql", table)
+        assert "editors    AggregateFunction(uniq, Nullable(String))" in body, table
+
+
+def test_minute_rollup_expires_and_daily_rollup_is_kept():
+    assert re.search(r"TTL .*INTERVAL 90 DAY", statement("02_rollups.sql", "wiki.edits_1m"))
+    assert "TTL" not in statement("02_rollups.sql", "wiki.edits_1d")
+
+
+def test_rollup_keys_are_time_then_wiki():
+    """AggregatingMergeTree merges on the sorting key, so the key is the grain."""
+    assert "ORDER BY (minute, wiki)" in statement("02_rollups.sql", "wiki.edits_1m")
+    assert "ORDER BY (day, wiki)" in statement("02_rollups.sql", "wiki.edits_1d")

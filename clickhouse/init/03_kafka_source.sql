@@ -1,6 +1,10 @@
 -- The cold path's ingest: ClickHouse consumes the same Kafka topic as the
 -- aggregator, as an independent consumer group.
 --
+-- This file must sort LAST. Consumption starts the moment the view below
+-- exists, and any materialized view on wiki.edits created after that point
+-- misses every row already ingested - on first boot, the entire backfill.
+--
 --   wiki-edits ──► wiki.edits_queue (Kafka engine)
 --                        │
 --            ┌───────────┴────────────┐
