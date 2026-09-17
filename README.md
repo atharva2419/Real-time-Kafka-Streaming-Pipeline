@@ -13,6 +13,25 @@ be wrong, which is what **[docs/DESIGN.md](docs/DESIGN.md)** is mostly about.
 
 ---
 
+## Screenshots
+
+**Live dashboard** — 5-second windows streamed over WebSocket: throughput, bot
+share, top wikis, top editors and edit types.
+
+![Live edit dashboard](docs/images/dashboard.png)
+
+**Pipeline health in Grafana** — ingest vs consume rate, consumer lag per
+partition, window emit delay against the 2.5 s target, and write latency.
+
+![Grafana pipeline health board](docs/images/grafana.png)
+
+**SQL console over the cold path** — a day of Wikipedia edits aggregated over
+227,600 rows in 0.01 s, running as a read-only user through the gateway.
+
+![ClickHouse SQL console](docs/images/clickhouse-console.png)
+
+---
+
 ## Architecture
 
 ```
