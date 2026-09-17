@@ -67,7 +67,7 @@ Wikimedia SSE firehose
          │
          ▼
   gateway (nginx) — localhost:8000
-  · /              live edit dashboard
+  · /              dashboard: Live and History tabs
   · /grafana/      pipeline health     ┐ with
   · /prometheus/   alerts and queries  ┘ --profile obs
 ```
@@ -94,13 +94,13 @@ Everything is served from that one address:
 
 | Path | What |
 |---|---|
-| http://localhost:8000/ | the live edit dashboard |
+| http://localhost:8000/ | the dashboard — **Live** (last 10 min, Redis) and **History** (up to 90 days, ClickHouse) |
 | http://localhost:8000/grafana/ | pipeline health board, provisioned, no login |
 | http://localhost:8000/prometheus/alerts | Prometheus and its eight alert rules |
 | http://localhost:8000/clickhouse | SQL console over the cold path, read-only |
 
-The dashboard header links to the other two, and dims those links when the
-`obs` profile isn't running.
+The dashboard header links to the others, and dims each link when that service
+isn't running.
 
 ```bash
 curl http://localhost:8000/healthz          # {"status":"ok",...,"partitions":6}
@@ -139,6 +139,13 @@ return **503** while the dashboard, the live routes and `/healthz` stay 200; sta
 it again and the analytics recover on the next request, with no API restart.
 `/healthz` reports the cold path under `cold_path` without letting it decide the
 verdict.
+
+The dashboard's **History** tab is built on these routes: ranges from `1h` to
+`90d`, each at a resolution that keeps the chart readable (`1h` per minute, `7d`
+hourly, `90d` daily), plotted as edits per minute so ranges compare directly.
+Downtime shows as gaps. Top editors stops at 7 days, the raw-event retention, and
+says so. With ClickHouse down the tab shows a banner and the Live tab carries on.
+Links like `/#history/7d` open a range directly.
 
 ### Running it without Docker
 
@@ -179,7 +186,7 @@ bots are typically 40–50%.
 ## Testing
 
 ```bash
-pytest                    # 229 tests
+pytest                    # 236 tests
 pytest --cov              # 100% on window.py, offsets.py, sink.py, merge.py
 ruff check .
 mypy                      # clean across pipeline/ and tests/
@@ -409,7 +416,7 @@ pipeline/
 └── api/
     ├── server.py          FastAPI: live and analytics routes, WebSocket
     └── static/index.html  dashboard
-tests/                     229 tests
+tests/                     236 tests
 docs/DESIGN.md             semantics, trade-offs, measurements
 docker/Dockerfile          one image, three entrypoints
 ```

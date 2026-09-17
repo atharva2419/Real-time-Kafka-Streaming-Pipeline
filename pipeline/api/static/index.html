@@ -9,13 +9,24 @@
   :root {
     --bg: #0e1117; --panel: #161b22; --line: #262d38;
     --text: #e6edf3; --muted: #8b949e; --accent: #58a6ff; --bot: #f0883e;
+    --warn: #d29922;
   }
   * { box-sizing: border-box; }
+  /* The browser's own [hidden] rule loses to any author `display`, and `main`
+     below sets display: grid - without this, hiding a view does nothing and
+     both tabs render stacked on one page. */
+  [hidden] { display: none !important; }
   body { margin: 0; background: var(--bg); color: var(--text);
          font: 14px/1.5 ui-sans-serif, system-ui, -apple-system, sans-serif; }
   header { padding: 20px 24px; border-bottom: 1px solid var(--line);
            display: flex; align-items: baseline; gap: 16px; flex-wrap: wrap; }
   h1 { font-size: 17px; margin: 0; font-weight: 600; }
+  .tabs { display: flex; gap: 4px; }
+  .tabs a { color: var(--muted); text-decoration: none; font-size: 13px;
+            padding: 3px 10px; border-radius: 6px; }
+  .tabs a:hover { color: var(--text); }
+  .tabs a[aria-current="page"] { color: var(--text); background: var(--panel);
+                                  box-shadow: inset 0 0 0 1px var(--line); }
   .links { margin-left: auto; display: flex; gap: 16px; font-size: 12px; }
   .links a { color: var(--muted); text-decoration: none; }
   .links a:hover { color: var(--text); }
@@ -28,26 +39,47 @@
          grid-template-columns: repeat(auto-fit, minmax(300px, 1fr)); }
   .card { background: var(--panel); border: 1px solid var(--line);
           border-radius: 10px; padding: 18px; }
-  .card.wide { grid-column: 1 / -1; }
+  .wide { grid-column: 1 / -1; }
   .card h2 { font-size: 12px; text-transform: uppercase; letter-spacing: .06em;
              color: var(--muted); margin: 0 0 14px; font-weight: 600; }
   .tiles { display: grid; gap: 16px; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
            grid-column: 1 / -1; }
   .tile { background: var(--panel); border: 1px solid var(--line);
-          border-radius: 10px; padding: 16px 18px; }
-  .tile .v { font-size: 26px; font-weight: 600; font-variant-numeric: tabular-nums; }
+          border-radius: 10px; padding: 16px 18px; min-width: 0; }
+  .tile .v { font-size: 26px; font-weight: 600; font-variant-numeric: tabular-nums;
+             overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
   .tile .k { font-size: 12px; color: var(--muted); margin-top: 2px; }
-  table { width: 100%; border-collapse: collapse; font-variant-numeric: tabular-nums; }
+  table { width: 100%; border-collapse: collapse; font-variant-numeric: tabular-nums;
+          table-layout: fixed; }
   td { padding: 5px 0; border-bottom: 1px solid var(--line); }
-  td:last-child { text-align: right; color: var(--muted); }
+  td:first-child { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  td:last-child { text-align: right; color: var(--muted); width: 90px; }
   tr:last-child td { border-bottom: 0; }
   .bar { height: 6px; background: var(--accent); border-radius: 3px; margin-top: 4px; }
+  .empty { color: var(--muted); font-size: 13px; padding: 6px 0; }
+
+  .toolbar { display: flex; align-items: center; gap: 16px; flex-wrap: wrap; }
+  .ranges { display: inline-flex; border: 1px solid var(--line); border-radius: 8px;
+            overflow: hidden; }
+  .ranges button { background: transparent; color: var(--muted); border: 0;
+                   border-right: 1px solid var(--line); padding: 6px 14px; font: inherit;
+                   font-size: 13px; cursor: pointer; }
+  .ranges button:last-child { border-right: 0; }
+  .ranges button:hover { color: var(--text); }
+  .ranges button[aria-pressed="true"] { background: var(--panel); color: var(--text); }
+  .note { color: var(--muted); font-size: 12px; }
+  .caption { color: var(--muted); font-size: 12px; margin: 10px 0 0; }
+  .banner { border: 1px solid var(--warn); color: var(--warn); border-radius: 10px;
+            padding: 12px 16px; font-size: 13px; }
 </style>
 </head>
 <body>
 <header>
   <h1>Wikimedia Edit Stream</h1>
-  <span style="color:var(--muted);font-size:12px">5-second tumbling windows</span>
+  <nav class="tabs" aria-label="Views">
+    <a href="#live" data-view="live">Live</a>
+    <a href="#history" data-view="history">History</a>
+  </nav>
   <nav class="links">
     <a id="lnk-grafana" href="/grafana/d/wiki-stream/wiki-stream-pipeline" target="_blank" rel="noopener">Pipeline health ↗</a>
     <a id="lnk-prometheus" href="/prometheus/alerts" target="_blank" rel="noopener">Alerts ↗</a>
@@ -56,7 +88,8 @@
   <span class="status"><span class="dot" id="dot"></span><span id="conn">connecting…</span></span>
 </header>
 
-<main>
+<!-- ======================================================= LIVE (hot path) -->
+<main id="view-live">
   <div class="tiles">
     <div class="tile"><div class="v" id="rate">–</div><div class="k">edits / second</div></div>
     <div class="tile"><div class="v" id="total">–</div><div class="k">edits this window</div></div>
@@ -65,7 +98,7 @@
   </div>
 
   <div class="card wide">
-    <h2>Throughput</h2>
+    <h2>Throughput · last 10 minutes, 5-second windows</h2>
     <canvas id="chart" height="90"></canvas>
   </div>
 
@@ -74,29 +107,97 @@
   <div class="card"><h2>Edit types</h2><table id="typetable"></table></div>
 </main>
 
+<!-- ==================================================== HISTORY (cold path) -->
+<main id="view-history" hidden>
+  <div class="toolbar wide">
+    <div class="ranges" role="group" aria-label="Time range">
+      <button data-range="1h">1h</button>
+      <button data-range="6h">6h</button>
+      <button data-range="24h">24h</button>
+      <button data-range="7d">7d</button>
+      <button data-range="30d">30d</button>
+      <button data-range="90d">90d</button>
+    </div>
+    <span class="note" id="h-note"></span>
+  </div>
+
+  <div class="banner wide" id="h-banner" hidden></div>
+
+  <div class="tiles">
+    <div class="tile"><div class="v" id="h-total">–</div><div class="k">edits in range</div></div>
+    <div class="tile"><div class="v" id="h-botpct">–</div><div class="k">bot share</div></div>
+    <div class="tile"><div class="v" id="h-new">–</div><div class="k">pages created</div></div>
+    <div class="tile"><div class="v" id="h-top">–</div><div class="k" id="h-top-k">busiest wiki</div></div>
+  </div>
+
+  <div class="card wide">
+    <h2 id="h-chart-title">Edits per minute</h2>
+    <canvas id="h-chart" height="90"></canvas>
+    <p class="caption">Gaps are periods when the pipeline was not running, not zero edits.
+      Rates are per minute at every resolution, so ranges compare directly.</p>
+  </div>
+
+  <div class="card"><h2>Top wikis</h2><table id="h-wikis"></table></div>
+  <div class="card"><h2 id="h-editors-title">Top editors</h2><table id="h-editors"></table></div>
+</main>
+
 <script>
-const MAX_POINTS = 120;
-const fmt = n => n.toLocaleString();
+// ---------------------------------------------------------------------------
+// Shared
+// ---------------------------------------------------------------------------
+
+const fmt = n => Number(n).toLocaleString();
 const clock = t => new Date(t * 1000).toLocaleTimeString();
 
-const chart = new Chart(document.getElementById("chart"), {
-  type: "line",
-  data: { labels: [], datasets: [
-    { label: "edits/sec", data: [], borderColor: "#58a6ff",
-      backgroundColor: "rgba(88,166,255,.12)", fill: true, tension: .3,
-      pointRadius: 0, borderWidth: 2 },
-    { label: "bot edits/sec", data: [], borderColor: "#f0883e",
-      backgroundColor: "transparent", tension: .3, pointRadius: 0, borderWidth: 1.5 },
-  ]},
-  options: {
-    responsive: true, animation: false, interaction: { intersect: false, mode: "index" },
-    scales: {
-      x: { grid: { color: "#262d38" }, ticks: { color: "#8b949e", maxTicksLimit: 8 } },
-      y: { grid: { color: "#262d38" }, ticks: { color: "#8b949e" }, beginAtZero: true },
+// Wiki names and usernames come from Wikipedia. MediaWiki happens to forbid
+// < and > in usernames, but this page does not rely on an upstream's input
+// rules to stay safe: everything user-derived is escaped before it is HTML.
+const esc = s => String(s).replace(/[&<>"']/g, c =>
+  ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" })[c]);
+
+// Series colours follow the entity, not the chart: edits are always blue and
+// bot edits always orange, on both tabs.
+const EDITS = "#58a6ff", BOTS = "#f0883e";
+
+function renderTable(id, rows, max) {
+  const el = document.getElementById(id);
+  if (!rows.length) {
+    el.innerHTML = `<tr><td class="empty">No data in this range.</td><td></td></tr>`;
+    return;
+  }
+  el.innerHTML = rows.map(([label, value]) => `
+    <tr><td title="${esc(label)}">${esc(label)}<div class="bar" style="width:${max ? (value / max) * 100 : 0}%"></div></td>
+    <td>${fmt(value)}</td></tr>`).join("");
+}
+
+function lineChart(canvas, editsLabel, botsLabel) {
+  return new Chart(canvas, {
+    type: "line",
+    data: { labels: [], datasets: [
+      { label: editsLabel, data: [], borderColor: EDITS,
+        backgroundColor: "rgba(88,166,255,.12)", fill: true, tension: .3,
+        pointRadius: 0, borderWidth: 2, spanGaps: false },
+      { label: botsLabel, data: [], borderColor: BOTS,
+        backgroundColor: "transparent", tension: .3, pointRadius: 0, borderWidth: 1.5,
+        spanGaps: false },
+    ]},
+    options: {
+      responsive: true, animation: false, interaction: { intersect: false, mode: "index" },
+      scales: {
+        x: { grid: { color: "#262d38" }, ticks: { color: "#8b949e", maxTicksLimit: 8 } },
+        y: { grid: { color: "#262d38" }, ticks: { color: "#8b949e" }, beginAtZero: true },
+      },
+      plugins: { legend: { labels: { color: "#8b949e", boxWidth: 12 } } },
     },
-    plugins: { legend: { labels: { color: "#8b949e", boxWidth: 12 } } },
-  },
-});
+  });
+}
+
+// ---------------------------------------------------------------------------
+// Live tab: Redis via WebSocket
+// ---------------------------------------------------------------------------
+
+const MAX_POINTS = 120;
+const chart = lineChart(document.getElementById("chart"), "edits/sec", "bot edits/sec");
 
 const stamps = [];
 
@@ -124,13 +225,6 @@ function pushPoint(p) {
   }
 }
 
-function renderTable(id, rows, max) {
-  const el = document.getElementById(id);
-  el.innerHTML = rows.map(([label, value]) => `
-    <tr><td>${label}<div class="bar" style="width:${max ? (value / max) * 100 : 0}%"></div></td>
-    <td>${fmt(value)}</td></tr>`).join("");
-}
-
 function render(w) {
   const counts = w.bot_vs_human, seen = counts.bot + counts.human;
   document.getElementById("rate").textContent = w.edits_per_second.toFixed(1);
@@ -152,7 +246,7 @@ function render(w) {
     t: w.window_start, rate: w.edits_per_second,
     bot: counts.bot, total: w.total_edits,
   });
-  chart.update();
+  if (currentView === "live") chart.update();
 }
 
 function setStatus(ok, text) {
@@ -174,7 +268,184 @@ function connect() {
   socket.onerror = () => socket.close();
 }
 
+// ---------------------------------------------------------------------------
+// History tab: ClickHouse via /api/analytics
+// ---------------------------------------------------------------------------
+
+// The bucket each range is drawn at. Every pair stays inside the API's
+// 1,440-point limit, and tests/test_dashboard.py checks each one against the
+// real validator, so the page can never request something the API refuses.
+const HISTORY_RANGES = {
+  "1h": "1m",
+  "6h": "5m",
+  "24h": "5m",
+  "7d": "1h",
+  "30d": "1d",
+  "90d": "1d",
+};
+const BUCKET_SECONDS = { "1m": 60, "5m": 300, "1h": 3600, "1d": 86400 };
+const RANGE_SECONDS = { "1h": 3600, "6h": 21600, "24h": 86400, "7d": 604800,
+                        "30d": 2592000, "90d": 7776000 };
+
+// Top editors reads raw events, which are kept for a week. Longer ranges ask
+// for the week and say so, rather than show a silently partial answer.
+const EDITOR_MAX_RANGE = "7d";
+
+const HISTORY_REFRESH_MS = 60_000;
+
+let historyChart = null;
+let historyRange = "24h";
+let historyTimer = null;
+
+async function getJSON(url) {
+  const res = await fetch(url, { cache: "no-store" });
+  const body = await res.json().catch(() => ({}));
+  if (!res.ok) {
+    const err = new Error(body.error || res.statusText);
+    err.status = res.status;
+    throw err;
+  }
+  return body;
+}
+
+function bucketLabel(t, bucket) {
+  const d = new Date(t * 1000);
+  if (bucket === "1d") return d.toLocaleDateString(undefined, { month: "short", day: "numeric" });
+  if (bucket === "1h") return d.toLocaleString(undefined,
+    { month: "short", day: "numeric", hour: "2-digit", minute: "2-digit" });
+  return d.toLocaleTimeString(undefined, { hour: "2-digit", minute: "2-digit" });
+}
+
+// The API returns only buckets that have data. Lay them onto the full grid of
+// buckets in the range, with null where nothing was recorded, so the chart
+// shows a gap for downtime instead of drawing a line straight across it.
+function toGrid(points, range, bucket) {
+  const step = BUCKET_SECONDS[bucket];
+  const now = Math.floor(Date.now() / 1000);
+  const end = Math.floor(now / step) * step;
+  const start = Math.floor((now - RANGE_SECONDS[range]) / step) * step;
+  const byTime = new Map(points.map(p => [p.t, p]));
+  const grid = [];
+  for (let t = start; t <= end; t += step) grid.push({ t, point: byTime.get(t) ?? null });
+  return grid;
+}
+
+function drawTimeline(points, range, bucket) {
+  if (!historyChart) {
+    historyChart = lineChart(document.getElementById("h-chart"), "edits/min", "bot edits/min");
+  }
+  const perMinute = BUCKET_SECONDS[bucket] / 60;
+  const grid = toGrid(points, range, bucket);
+
+  historyChart.data.labels = grid.map(g => bucketLabel(g.t, bucket));
+  historyChart.data.datasets[0].data =
+    grid.map(g => g.point ? +(g.point.edits / perMinute).toFixed(1) : null);
+  historyChart.data.datasets[1].data =
+    grid.map(g => g.point ? +(g.point.bot_edits / perMinute).toFixed(1) : null);
+  historyChart.update();
+
+  const resolution = { "1m": "1-minute", "5m": "5-minute", "1h": "hourly", "1d": "daily" }[bucket];
+  document.getElementById("h-chart-title").textContent =
+    `Edits per minute · last ${range}, ${resolution} buckets`;
+}
+
+function drawTiles(points, wikis) {
+  // Deliberately no "distinct editors" tile: per-bucket distinct counts cannot
+  // be added up - one editor active in two buckets would count twice.
+  const total = points.reduce((a, p) => a + p.edits, 0);
+  const bots = points.reduce((a, p) => a + p.bot_edits, 0);
+  const created = points.reduce((a, p) => a + p.new_pages, 0);
+
+  document.getElementById("h-total").textContent = total ? fmt(total) : "–";
+  document.getElementById("h-botpct").textContent =
+    total ? Math.round((bots / total) * 100) + "%" : "–";
+  document.getElementById("h-new").textContent = total ? fmt(created) : "–";
+
+  const top = wikis[0];
+  document.getElementById("h-top").textContent = top ? top.wiki : "–";
+  document.getElementById("h-top").title = top ? top.wiki : "";
+  document.getElementById("h-top-k").textContent =
+    top ? `busiest wiki · ${fmt(top.edits)} edits` : "busiest wiki";
+}
+
+function showBanner(text) {
+  const el = document.getElementById("h-banner");
+  el.textContent = text;
+  el.hidden = !text;
+}
+
+async function loadHistory(range) {
+  historyRange = range;
+  document.querySelectorAll(".ranges button").forEach(b =>
+    b.setAttribute("aria-pressed", String(b.dataset.range === range)));
+  if (location.hash !== `#history/${range}`) history.replaceState(null, "", `#history/${range}`);
+
+  const bucket = HISTORY_RANGES[range];
+  const editorRange = RANGE_SECONDS[range] > RANGE_SECONDS[EDITOR_MAX_RANGE] ? EDITOR_MAX_RANGE : range;
+  document.getElementById("h-editors-title").textContent =
+    editorRange === range ? "Top editors" : "Top editors · last 7 days (raw events are kept a week)";
+  document.getElementById("h-note").textContent = "loading…";
+
+  try {
+    const [timeline, top, editors] = await Promise.all([
+      getJSON(`/api/analytics/timeline?range=${range}&bucket=${bucket}`),
+      getJSON(`/api/analytics/top-wikis?range=${range}&limit=10`),
+      getJSON(`/api/analytics/top-editors?range=${editorRange}&limit=10`),
+    ]);
+    if (range !== historyRange) return;  // a newer range was picked meanwhile
+
+    showBanner("");
+    drawTimeline(timeline.points, range, bucket);
+    drawTiles(timeline.points, top.wikis);
+    renderTable("h-wikis", top.wikis.map(w => [w.wiki, w.edits]), top.wikis[0]?.edits ?? 0);
+    renderTable("h-editors", editors.editors.map(e => [e.user, e.edits]),
+                editors.editors[0]?.edits ?? 0);
+    document.getElementById("h-note").textContent =
+      `Updated ${new Date().toLocaleTimeString()} · rollups refresh every minute`;
+  } catch (err) {
+    if (range !== historyRange) return;
+    document.getElementById("h-note").textContent = "";
+    showBanner(err.status === 503
+      ? "History is unavailable: ClickHouse can't be reached. The Live tab is unaffected - it reads a different store."
+      : `Could not load history: ${err.message}`);
+  }
+}
+
+document.querySelectorAll(".ranges button").forEach(b =>
+  b.addEventListener("click", () => loadHistory(b.dataset.range)));
+
+// ---------------------------------------------------------------------------
+// Views: #live, #history, #history/<range>
+// ---------------------------------------------------------------------------
+
+let currentView = "live";
+
+function showView() {
+  const [view, range] = location.hash.replace(/^#/, "").split("/");
+  currentView = view === "history" ? "history" : "live";
+
+  document.getElementById("view-live").hidden = currentView !== "live";
+  document.getElementById("view-history").hidden = currentView !== "history";
+  document.querySelectorAll(".tabs a").forEach(a => {
+    if (a.dataset.view === currentView) a.setAttribute("aria-current", "page");
+    else a.removeAttribute("aria-current");
+  });
+
+  clearInterval(historyTimer);
+  if (currentView === "history") {
+    loadHistory(HISTORY_RANGES[range] ? range : historyRange);
+    // The rollups only change once a minute; polling faster buys nothing.
+    historyTimer = setInterval(() => loadHistory(historyRange), HISTORY_REFRESH_MS);
+  } else {
+    // A chart drawn while its canvas was hidden has no size; redraw on return.
+    chart.resize();
+    chart.update();
+  }
+}
+
+window.addEventListener("hashchange", showView);
 connect();
+showView();
 
 // The metrics stack is an optional Compose profile. Dim its links when it is not
 // running rather than let them lead to a dead end.
